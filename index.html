@@ -1775,7 +1775,7 @@ select, input, textarea {
 
 .rec-card {
   display: grid;
-  grid-template-columns: 70px 1fr auto;
+  grid-template-columns: 82px 1fr auto;
   gap: 10px;
   align-items: center;
   padding: 7px 12px;
@@ -1805,16 +1805,16 @@ select, input, textarea {
 .rec-dia {
   font-family: var(--font-display);
   font-weight: 700;
-  font-size: 10px;
+  font-size: 12px;
   color: var(--azul);
   text-transform: capitalize;
   white-space: normal;
-  line-height: 1.15;
+  line-height: 1.2;
   word-break: break-word;
 }
 .rec-hora {
   font-family: var(--font-display);
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 800;
   color: var(--text);
   white-space: nowrap;
@@ -7849,10 +7849,19 @@ function renderAgenda(view) {
   futuros.sort((a,b) => (a.fecha+a.hora).localeCompare(b.fecha+b.hora));
 
   const f = APP.filtrosAgenda || { fecha: '', vendedor: '', tipo: 'todos' };
-  const vendedoresAgenda = Array.from(new Set([
-    ...((_vendedoresCache || []).map(u => u.nombre)),
+  // Antes esto mezclaba nombres completos (de _vendedoresCache) con usernames
+  // crudos (de r.vendedor) en un mismo Set: como son textos distintos para la
+  // misma persona ("Oscar Leonardo Sanchez Becerra" vs "oscarsanchez"), salían
+  // como dos asesores diferentes en el filtro, y encima elegir el de "nombre"
+  // no filtraba nada porque pasaFiltrosAgenda compara contra el username.
+  // Ahora se deduplica por username y se muestra siempre el nombre completo.
+  const _usernamesAgenda = Array.from(new Set([
+    ...((_vendedoresCache || []).map(u => u.username)),
     ...USER.recordatorios.map(r => r.vendedor).filter(Boolean),
-  ])).sort();
+  ]));
+  const vendedoresAgenda = _usernamesAgenda
+    .map(u => ({ username: u, label: nombreVendedor(u) || u }))
+    .sort((a, b) => a.label.localeCompare(b.label));
   const filtrosActivos = !!(f.fecha || f.vendedor || (f.tipo && f.tipo !== 'todos'));
 
   view.innerHTML = `
@@ -7884,7 +7893,7 @@ function renderAgenda(view) {
         <label>Asesor:</label>
         <select onchange="setFiltroAgenda('vendedor', this.value)">
           <option value="">Todos</option>
-          ${vendedoresAgenda.map(v => `<option value="${escapeHTML(v)}" ${f.vendedor===v?'selected':''}>${escapeHTML(v)}</option>`).join('')}
+          ${vendedoresAgenda.map(v => `<option value="${escapeHTML(v.username)}" ${f.vendedor===v.username?'selected':''}>${escapeHTML(v.label)}</option>`).join('')}
         </select>
       </div>
       <div class="filtro-grupo">
