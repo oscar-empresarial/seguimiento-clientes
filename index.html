@@ -1801,20 +1801,23 @@ select, input, textarea {
   opacity: 0.7;
 }
 
-.rec-fecha-big { display: flex; flex-direction: row; gap: 5px; align-items: baseline; justify-content: center; }
+.rec-fecha-big { display: flex; flex-direction: column; gap: 2px; align-items: center; justify-content: center; text-align: center; overflow: hidden; }
 .rec-dia {
   font-family: var(--font-display);
   font-weight: 700;
-  font-size: 11px;
+  font-size: 10px;
   color: var(--azul);
   text-transform: capitalize;
-  white-space: nowrap;
+  white-space: normal;
+  line-height: 1.15;
+  word-break: break-word;
 }
 .rec-hora {
   font-family: var(--font-display);
   font-size: 13px;
   font-weight: 800;
   color: var(--text);
+  white-space: nowrap;
 }
 
 .rec-content { cursor: pointer; min-width: 0; }
