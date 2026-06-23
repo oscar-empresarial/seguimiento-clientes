@@ -4329,16 +4329,22 @@ function puede(permiso) {
 // ---------- CARGAR DATOS DEL SERVIDOR ----------
 async function cargarDatosUsuario() {
   try {
-    const r = await apiCall('cargar', {}, 45000);
+    // Antes 'cargar' y 'listar_capturas' iban uno detrás del otro (await, luego await),
+    // así que los prospectos esperaban a que TODA la carga principal terminara antes de
+    // ni siquiera empezar a pedirse — el doble de tiempo de espera. Ahora se disparan
+    // las dos peticiones al mismo tiempo y se esperan en paralelo.
+    const pCargar = apiCall('cargar', {}, 45000);
+    const pCapturas = apiCall('listar_capturas', {}, 20000).catch(() => null); // no bloquear la carga principal si esto falla
 
-    // Prospectos (Captura Rápida) — no bloquear la carga principal si esto falla
-    try {
-      const rp = await apiCall('listar_capturas', {}, 20000);
+    const r = await pCargar;
+
+    const rp = await pCapturas;
+    if (rp) {
       APP.prospectos = rp.capturas || [];
       _prospectosListosLimpieza = true;
       intentarLimpiarHuerfanos();
-    } catch (ePros) { /* deja lo que ya hubiera en APP.prospectos */ }
-    
+    }
+
     // Mezclar con USER global
     USER.asignaciones = r.asignaciones || {};
     USER.notas = r.notas || {};
@@ -4523,7 +4529,7 @@ function actualizarEstadoConexion(estado) {
   }
 
   if (estado === 'cache' || estado === 'warn' || estado === 'error') {
-    el.innerHTML = '<span class="dot-conn dot-conn-warn"></span> Modo rápido';
+    el.innerHTML = '<span class="dot-conn dot-conn-warn"></span> Conexión lenta · viendo datos guardados';
     el.className = 'estado-conn warn';
     return;
   }
@@ -7344,6 +7350,87 @@ function accionRecordatorioInfo(id) {
   return ACCIONES_RECORDATORIO.find(a => a.id === id) || null;
 }
 
+// ============================================================
+// EMBUDO DE VENTAS: etapas de un prospecto (CapturaRapida.estado)
+// ============================================================
+// 'prospecto' es el valor histórico que el backend pone por defecto al crear
+// un prospecto (antes de que existiera el embudo) — lo tratamos igual que
+// 'sin_contacto' para que los prospectos viejos no queden sin etapa.
+const ETAPAS_EMBUDO = [
+  { id: 'sin_contacto', emoji: '⚪', label: 'Sin contacto', color: '#94a3b8' },
+  { id: 'contactado',   emoji: '🔵', label: 'Contactado',   color: '#3b82f6' },
+  { id: 'cotizado',     emoji: '🟠', label: 'Cotizado',     color: '#f59e0b' },
+  { id: 'ganado',       emoji: '🟢', label: 'Ganado',       color: '#22c55e' },
+  { id: 'perdido',      emoji: '🔴', label: 'Perdido',      color: '#ef4444' },
+];
+
+function etapaDeProspecto(p) {
+  const id = (!p || !p.estado || p.estado === 'prospecto') ? 'sin_contacto' : p.estado;
+  return ETAPAS_EMBUDO.find(e => e.id === id) || ETAPAS_EMBUDO[0];
+}
+
+function etapaPillHTML(p) {
+  const et = etapaDeProspecto(p);
+  return `<span class="tipo-pill" style="background:${et.color}22;color:${et.color};border:1px solid ${et.color}55;font-weight:600">${et.emoji} ${escapeHTML(et.label)}</span>`;
+}
+
+// Mapeo: qué etapa del embudo se activa según el botón de "Resultado de la
+// llamada" que el vendedor elige. Solo aplica a prospectos (los clientes
+// reales de Siigo ya tienen su propio semáforo y no usan estas etapas).
+// "Número equivocado" no mueve nada: es un dato malo, no una gestión real.
+const RESULTADO_A_ETAPA = {
+  'Cotización enviada': 'cotizado',
+  'Venta cerrada': 'ganado',
+  'No interesado': 'perdido',
+  'No contestó': 'contactado',
+  'Cita agendada': 'contactado',
+  'Volver a llamar': 'contactado',
+  'Solo conversamos': 'contactado',
+};
+
+// resultadoConEmoji llega como "✉️ Cotización enviada" — solo nos interesa el texto.
+function etapaSegunResultado(resultadoConEmoji) {
+  const texto = String(resultadoConEmoji || '').replace(/^[^\s]+\s*/, '').trim();
+  return RESULTADO_A_ETAPA[texto] || null;
+}
+
+// Actualiza la etapa de un prospecto en el embudo: refleja el cambio de
+// inmediato en pantalla y lo guarda en el backend (mismo patrón que el resto
+// de ediciones de prospecto, vía editar_captura).
+async function actualizarEtapaProspecto(prospectoId, nuevaEtapa, opts) {
+  const idx = (APP.prospectos || []).findIndex(x => x.id === prospectoId);
+  if (idx === -1) return;
+  const etapaAnterior = APP.prospectos[idx].estado;
+  if (etapaAnterior === nuevaEtapa) return;
+  APP.prospectos[idx].estado = nuevaEtapa;
+  try {
+    await apiCall('editar_captura', { id: prospectoId, cambios: { estado: nuevaEtapa } });
+    if (!(opts && opts.silencioso)) {
+      const et = ETAPAS_EMBUDO.find(e => e.id === nuevaEtapa);
+      mostrarToast('Etapa actualizada: ' + (et ? et.emoji + ' ' + et.label : nuevaEtapa));
+    }
+  } catch (e) {
+    // Si falla el guardado remoto, revertimos el cambio local para no mostrar
+    // una etapa que en realidad no quedó guardada.
+    APP.prospectos[idx].estado = etapaAnterior;
+    mostrarToast('No se pudo actualizar la etapa: ' + e.message, true);
+  }
+}
+
+// Normaliza un NIT/CC para comparar: solo dígitos, sin dígito de verificación
+// (todo lo que viene después de un guión, igual que normalizarIdentificacion en el backend).
+function normalizarDocumentoFE(doc) {
+  return String(doc || '').split('-')[0].replace(/\D/g, '').trim();
+}
+
+// Busca si el documento de un prospecto ya aparece como cliente real en Siigo.
+// Devuelve el cliente si hay coincidencia exacta de NIT/CC, o null.
+function clienteSiigoCoincidente(p) {
+  const doc = normalizarDocumentoFE(p && p.documento);
+  if (!doc) return null;
+  return (APP.data.clientes || []).find(c => normalizarDocumentoFE(c.id) === doc) || null;
+}
+
 function chipsAccionRecordatorioHTML(accionActual) {
   return `
     <label>Próxima acción (opcional):</label>
@@ -7716,6 +7803,15 @@ function guardarLlamadaRapida(clienteId, fechaDef, horaDef) {
 
   if (!USER.llamadas[clienteId]) USER.llamadas[clienteId] = [];
   USER.llamadas[clienteId].push(llamada);
+
+  // Si el contacto registrado es de un prospecto (no un cliente real de Siigo),
+  // el resultado elegido también mueve su etapa en el embudo de ventas — para
+  // que no quede solo como texto en el historial, sino como un paso concreto.
+  const _prospectoDeEstaLlamada = (APP.prospectos || []).find(x => x.id === clienteId);
+  if (_prospectoDeEstaLlamada) {
+    const nuevaEtapa = etapaSegunResultado(resultado);
+    if (nuevaEtapa) actualizarEtapaProspecto(clienteId, nuevaEtapa, { silencioso: true });
+  }
 
   // Si este registro viene de "Marcar como hecho" sobre un recordatorio puntual de
   // la Agenda, ese recordatorio queda completado (con trazabilidad de qué pasó),
@@ -8117,10 +8213,17 @@ function cambiarTabProspectos(tab) {
   render();
 }
 
+function setFiltroProspectosEtapa(etapa) {
+  APP.filtroProspectosEtapa = etapa;
+  render();
+}
+
 function renderProspectos(view) {
   const todosSinFiltrar = APP.prospectos || [];
   const filtroVendedor = APP.filtroProspectosVendedor || '';
-  const todos = filtroVendedor ? todosSinFiltrar.filter(p => (p.vendedor || '') === filtroVendedor) : todosSinFiltrar;
+  const filtroEtapa = APP.filtroProspectosEtapa || '';
+  let todos = filtroVendedor ? todosSinFiltrar.filter(p => (p.vendedor || '') === filtroVendedor) : todosSinFiltrar;
+  if (filtroEtapa) todos = todos.filter(p => etapaDeProspecto(p).id === filtroEtapa);
   const tab = APP.tabProspectos || 'todos';
   const lista = tab === 'todos' ? todos : todos.filter(p => (p.tipo || 'empresa') === tab);
 
@@ -8170,6 +8273,13 @@ function renderProspectos(view) {
           ${asesores.map(a => `<option value="${escapeHTML(a)}" ${filtroVendedor === a ? 'selected' : ''}>${escapeHTML(asesoresMap[a])}</option>`).join('')}
         </select>
       </div>
+      <div class="filtro-grupo">
+        <label>Etapa:</label>
+        <select onchange="setFiltroProspectosEtapa(this.value)">
+          <option value="">Todas</option>
+          ${ETAPAS_EMBUDO.map(et => `<option value="${et.id}" ${filtroEtapa === et.id ? 'selected' : ''}>${et.emoji} ${escapeHTML(et.label)}</option>`).join('')}
+        </select>
+      </div>
     </div>
 
     <div class="card">
@@ -8189,10 +8299,13 @@ function itemProspecto(p) {
   // (trazabilidad de contactos, productos hablados, dirección, etc.) se ve al
   // hacer clic, en abrirDetalleProspecto.
   const numSeguimientos = ((USER.llamadas && USER.llamadas[p.id]) || []).length;
+  const coincidencia = clienteSiigoCoincidente(p);
   return `
     <div class="prospecto-card" onclick="abrirDetalleProspecto('${escapeHTML(p.id)}')" style="cursor:pointer">
       <div class="prospecto-content">
-        <div class="rec-cliente-nom">${emojiTipo} ${escapeHTML(p.empresa || p.nombre)}</div>
+        <div class="rec-cliente-nom" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          ${emojiTipo} ${escapeHTML(p.empresa || p.nombre)} ${etapaPillHTML(p)}
+        </div>
         <div class="rec-desc-full">${[
           p.empresa ? '👤 ' + escapeHTML(p.nombre) : '',
           p.telefono ? '📞 ' + escapeHTML(p.telefono) : '',
@@ -8200,6 +8313,7 @@ function itemProspecto(p) {
           fechaStr,
           numSeguimientos > 0 ? `📋 ${numSeguimientos} seguimiento${numSeguimientos === 1 ? '' : 's'}` : 'sin seguimientos aún',
         ].filter(Boolean).join(' · ')}</div>
+        ${coincidencia ? `<div style="margin-top:4px;font-size:12px;color:#16a34a;font-weight:600">🎉 Coincide con cliente Siigo: ${escapeHTML(coincidencia.nombre || coincidencia.id)} — abre y confirma la conversión</div>` : ''}
       </div>
       <div class="prospecto-acciones">
         <button class="btn-icon-text" onclick="event.stopPropagation(); abrirModalRecordatorio('${escapeHTML(p.id)}')" title="Programar recordatorio">⏰</button>
@@ -8251,17 +8365,27 @@ function renderDetalleProspecto(p) {
     llamadasOrdenadas.map(l => (l.producto || '').trim()).filter(Boolean)
   ));
 
+  const coincidenciaDetalle = clienteSiigoCoincidente(p);
+
   return `
     <div style="display:flex;justify-content:space-between;align-items:start;gap:10px">
       <div>
-        <h3 style="margin:0 0 4px">${emojiTipo} ${escapeHTML(p.empresa || p.nombre)}</h3>
+        <h3 style="margin:0 0 4px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">${emojiTipo} ${escapeHTML(p.empresa || p.nombre)} ${etapaPillHTML(p)}</h3>
         ${p.empresa ? `<div class="muted" style="font-size:13px">👤 ${escapeHTML(p.nombre)}</div>` : ''}
       </div>
       <button class="btn-icon-text" onclick="cerrarModal('modal-detalle-prospecto')" title="Cerrar">✕</button>
     </div>
 
+    ${coincidenciaDetalle ? `
+      <div style="background:#dcfce7;border:1px solid #86efac;border-radius:8px;padding:10px;margin-top:10px;font-size:13px">
+        🎉 El NIT/CC de este prospecto coincide con <strong>${escapeHTML(coincidenciaDetalle.nombre || coincidenciaDetalle.id)}</strong>, que ya es cliente en Siigo.
+        <button type="button" class="btn btn-primary btn-small" style="margin-top:6px;display:block" onclick="confirmarConversionProspecto('${escapeHTML(p.id)}')">✓ Confirmar conversión a cliente</button>
+      </div>
+    ` : ''}
+
     <div style="margin-top:10px;display:flex;flex-direction:column;gap:4px;font-size:13px">
       ${p.telefono ? `<div>📞 <a href="tel:${escapeHTML(p.telefono)}">${escapeHTML(p.telefono)}</a></div>` : ''}
+      ${p.documento ? `<div>🪪 NIT/CC: ${escapeHTML(p.documento)}</div>` : ''}
       ${p.direccion ? `<div>📍 ${escapeHTML(p.direccion)}</div>` : ''}
       ${p.seguimiento ? `<div>📝 Nota actual: ${escapeHTML(p.seguimiento)}</div>` : ''}
       <div class="muted">Capturado por ${escapeHTML(p.vendedorNombre || p.vendedor || '')}${fechaStr ? ' · ' + fechaStr : ''}</div>
@@ -8771,10 +8895,34 @@ function cerrarNotif() {
   document.getElementById('notif-app').classList.remove('active');
 }
 
+// IMPORTANTE: hay que reusar UN SOLO AudioContext para toda la app, no crear uno
+// nuevo cada vez. Los navegadores crean los AudioContext nuevos en estado
+// "suspended" cuando no vienen de un clic/toque del usuario (política de
+// autoplay) — por eso el sonido de los recordatorios automáticos (que se
+// disparan desde un setInterval, no de un clic) nunca se escuchaba, aunque el
+// código "funcionaba" sin ningún error. Si reusamos el mismo contexto y lo
+// desbloqueamos una vez con cualquier clic/toque del usuario, se queda
+// desbloqueado para siempre y los sonidos automáticos posteriores sí suenan.
+let _audioCtxCompartido = null;
+function _obtenerAudioCtx() {
+  if (!_audioCtxCompartido) {
+    _audioCtxCompartido = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (_audioCtxCompartido.state === 'suspended') {
+    _audioCtxCompartido.resume().catch(() => {});
+  }
+  return _audioCtxCompartido;
+}
+// Desbloquea el audio en cuanto el usuario interactúe por primera vez con la
+// página (clic, toque o tecla), sin esperar a que abra el panel de notificaciones.
+['click', 'touchstart', 'keydown'].forEach(ev => {
+  window.addEventListener(ev, () => _obtenerAudioCtx(), { once: true, passive: true });
+});
+
 function reproducirSonido() {
   // Sonido sintético amigable (chime de 3 notas)
   try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const ctx = _obtenerAudioCtx();
     const notas = [523.25, 659.25, 783.99]; // Do, Mi, Sol
     notas.forEach((freq, i) => {
       const osc = ctx.createOscillator();
@@ -10936,6 +11084,14 @@ window.addEventListener('load', () => {
         <input id="cv-direccion" type="text" placeholder="Dirección (opcional)">
       </div>
       <div class="cv-campo">
+        <label>NIT o CC (opcional) <a href="javascript:void(0)" onclick="reabrirTipNit()" style="font-size:11px;font-weight:400" title="¿Para qué sirve este campo?">ℹ️ ¿para qué?</a></label>
+        <input id="cv-documento" type="text" placeholder="Si lo tienes a mano, mejor — ver nota abajo">
+      </div>
+      <div id="cv-tip-nit" class="muted" style="font-size:12px;border:1px dashed var(--border,#ddd);border-radius:8px;padding:8px 10px;margin:-4px 0 4px;display:flex;justify-content:space-between;gap:8px;align-items:start">
+        <span>💡 Cuando este prospecto <strong>compre</strong>, vuelve a entrar aquí y pon su NIT o Cédula: así el sistema lo reconoce solo como cliente y queda el dato de cuántos prospectos se volvieron clientes.</span>
+        <button type="button" onclick="document.getElementById('cv-tip-nit').style.display='none'; localStorage.setItem('fc_tip_nit_oculto','1');" style="border:none;background:none;cursor:pointer;font-size:14px;flex-shrink:0" title="Ocultar">✕</button>
+      </div>
+      <div class="cv-campo">
         <label>Tipo</label>
         <select id="cv-tipo">
           <option value="" disabled selected>Selecciona el tipo...</option>
@@ -11147,7 +11303,16 @@ let _cvTextoCompleto = ''; // acumula TODO lo dictado en la sesión actual del m
 
 async function abrirCapturaVoz() {
   document.getElementById('modal-captura-voz').classList.add('active');
+  const tip = document.getElementById('cv-tip-nit');
+  if (tip) tip.style.display = localStorage.getItem('fc_tip_nit_oculto') === '1' ? 'none' : 'flex';
   await cvCargarVendedores();
+}
+
+// Vuelve a mostrar el aviso del NIT/CC aunque el vendedor lo haya cerrado antes.
+function reabrirTipNit() {
+  localStorage.removeItem('fc_tip_nit_oculto');
+  const tip = document.getElementById('cv-tip-nit');
+  if (tip) tip.style.display = 'flex';
 }
 
 async function cvCargarVendedores() {
@@ -11419,6 +11584,7 @@ async function cvGuardar() {
     nombre,
     empresa:    document.getElementById('cv-empresa').value.trim(),
     telefono:   document.getElementById('cv-telefono').value.trim(),
+    documento:  document.getElementById('cv-documento').value.trim(),
     direccion:  document.getElementById('cv-direccion').value.trim(),
     tipo:       document.getElementById('cv-tipo').value,
     seguimiento:document.getElementById('cv-seguimiento').value.trim(),
@@ -11444,7 +11610,7 @@ async function cvGuardar() {
         nombre: datos.nombre,
         empresa: datos.empresa,
         telefono: datos.telefono,
-        documento: '',
+        documento: datos.documento || '',
         direccion: datos.direccion,
         tipo: datos.tipo,
         seguimiento: datos.seguimiento,
@@ -11471,7 +11637,7 @@ async function cvGuardar() {
 }
 
 function cvLimpiar() {
-  ['nombre','empresa','telefono','direccion','seguimiento'].forEach(id => {
+  ['nombre','empresa','telefono','documento','direccion','seguimiento'].forEach(id => {
     document.getElementById('cv-' + id).value = '';
   });
   document.getElementById('cv-tipo').value = '';
@@ -11534,6 +11700,9 @@ async function abrirModalEditarProspecto(id) {
     </select>
   ` : '';
 
+  const coincidencia = clienteSiigoCoincidente(p);
+  const etapaActual = etapaDeProspecto(p).id;
+
   body.innerHTML = `
     <h3 style="margin:0 0 14px">Editando: ${escapeHTML(p.nombre)}</h3>
     <form id="form-editar-prospecto" onsubmit="guardarEdicionProspecto(event, '${escapeHTML(id)}')">
@@ -11543,6 +11712,14 @@ async function abrirModalEditarProspecto(id) {
       <input type="text" name="empresa" value="${escapeHTML(p.empresa || '')}">
       <label>Teléfono:</label>
       <input type="text" name="telefono" value="${escapeHTML(p.telefono || '')}">
+      <label>NIT o CC (opcional) <a href="javascript:void(0)" onclick="reabrirTipNit(); mostrarToast('Tip: pon el NIT/CC cuando este prospecto compre, para que se reconozca como cliente solo.');" style="font-size:11px;font-weight:400">ℹ️ ¿para qué?</a></label>
+      <input type="text" name="documento" value="${escapeHTML(p.documento || '')}" placeholder="Llena esto cuando ya haya comprado">
+      ${coincidencia ? `
+        <div style="background:#dcfce7;border:1px solid #86efac;border-radius:8px;padding:10px;margin:4px 0 10px;font-size:13px">
+          🎉 Este NIT/CC coincide con <strong>${escapeHTML(coincidencia.nombre || coincidencia.id)}</strong>, que ya es cliente en Siigo.
+          <button type="button" class="btn btn-primary btn-small" style="margin-top:6px;display:block" onclick="confirmarConversionProspecto('${escapeHTML(id)}')">✓ Confirmar conversión a cliente</button>
+        </div>
+      ` : ''}
       <label>Dirección:</label>
       <input type="text" name="direccion" value="${escapeHTML(p.direccion || '')}">
       <label>Tipo:</label>
@@ -11551,6 +11728,14 @@ async function abrirModalEditarProspecto(id) {
         <option value="hogar" ${p.tipo === 'hogar' ? 'selected' : ''}>🏠 Hogar</option>
         <option value="distribuidor" ${p.tipo === 'distribuidor' ? 'selected' : ''}>🚚 Distribuidor</option>
       </select>
+      <label>Etapa en el embudo de ventas:</label>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+        ${ETAPAS_EMBUDO.map(et => `
+          <button type="button" class="accion-chip etapa-chip ${etapaActual === et.id ? 'activo' : ''}"
+            onclick="editarProspectoSeleccionarEtapa(this, '${et.id}')" data-etapa="${et.id}">${et.emoji} ${escapeHTML(et.label)}</button>
+        `).join('')}
+      </div>
+      <input type="hidden" name="estado" value="${escapeHTML(etapaActual)}">
       <label>Seguimiento / nota:</label>
       <textarea name="seguimiento" rows="3">${escapeHTML(p.seguimiento || '')}</textarea>
       ${selectorVendedor}
@@ -11562,6 +11747,26 @@ async function abrirModalEditarProspecto(id) {
   `;
 }
 
+function editarProspectoSeleccionarEtapa(btn, etapaId) {
+  const grupo = btn.parentElement;
+  grupo.querySelectorAll('.etapa-chip').forEach(b => b.classList.remove('activo'));
+  btn.classList.add('activo');
+  const form = btn.closest('form');
+  if (form && form.estado) form.estado.value = etapaId;
+}
+
+// Marca manualmente un prospecto como convertido en cliente (cuando el NIT/CC
+// coincide con un cliente real de Siigo). No borra el prospecto: lo deja en
+// etapa "Ganado" para que quede la trazabilidad de que se convirtió.
+async function confirmarConversionProspecto(id) {
+  await actualizarEtapaProspecto(id, 'ganado');
+  ['modal-editar-prospecto', 'modal-detalle-prospecto'].forEach(m => {
+    const el = document.getElementById(m);
+    if (el && el.classList.contains('active')) cerrarModal(m);
+  });
+  render();
+}
+
 async function guardarEdicionProspecto(e, id) {
   e.preventDefault();
   const f = e.target;
@@ -11570,9 +11775,11 @@ async function guardarEdicionProspecto(e, id) {
     nombre: f.nombre.value.trim(),
     empresa: f.empresa.value.trim(),
     telefono: f.telefono.value.trim(),
+    documento: f.documento.value.trim(),
     direccion: f.direccion.value.trim(),
     tipo: f.tipo.value,
     seguimiento: f.seguimiento.value.trim(),
+    estado: f.estado.value,
   };
   if (f.vendedor) {
     cambios.vendedor = f.vendedor.value;
