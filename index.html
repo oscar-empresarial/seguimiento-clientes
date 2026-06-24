@@ -1861,13 +1861,15 @@ select, input, textarea {
   background: var(--bg-card);
   border: 1px solid var(--bord);
   border-radius: var(--radius);
-  margin-bottom: 5px;
+  margin-bottom: 7px;
   border-left: 3px solid var(--azul);
   transition: all 0.12s;
 }
 .prospecto-card:hover { box-shadow: var(--shadow-md); }
 .prospecto-content { flex: 1 1 240px; min-width: 0; }
-.prospecto-acciones { display: flex; gap: 4px; flex-wrap: wrap; flex: 0 0 auto; }
+/* Ahora va pegado al nombre (dentro de .rec-cliente-nom), no en una columna aparte
+   al borde derecho — así el botón de cada fila queda justo junto a su nombre. */
+.prospecto-acciones { display: inline-flex; gap: 2px; flex-wrap: nowrap; margin-left: 2px; }
 
 /* CLIENTES DEL DÍA */
 .hoy-grid {
@@ -4234,6 +4236,19 @@ function authInit() {
 }
 
 // ---------- API CALL ----------
+// Acciones de SOLO LECTURA: si la respuesta nunca llega (timeout/red caída), repetir
+// la petición es seguro porque no crea ni modifica nada. Para todo lo demás (crear,
+// editar, borrar, sincronizar...) NO se reintenta solo, porque si la petición original
+// SÍ llegó al servidor y solo se perdió la respuesta (servidor lento, no error real),
+// reintentar crearía un registro duplicado — esto es justo lo que causó que un
+// prospecto dictado por voz se guardara 2 o 3 veces ("triplicado").
+const ACCIONES_REINTENTABLES_AUTOMATICAMENTE = new Set([
+  'login', 'cargar', 'listar_capturas', 'listar_vendedores', 'admin_listar_usuarios',
+  'admin_ver_log', 'admin_siigo_estado', 'admin_siigo_historial', 'cargar_clientes',
+  'cliente_cotizaciones', 'cliente_cartera', 'cliente_facturas', 'cartera_obtener',
+  'carrera_obtener',
+]);
+
 async function apiCall(action, body, timeoutMs, _intento) {
   timeoutMs = timeoutMs || 30000;
   const intento = _intento || 1;
@@ -4267,11 +4282,11 @@ async function apiCall(action, body, timeoutMs, _intento) {
     clearTimeout(timer);
     const esErrorDeRed = e.name === 'AbortError' || e instanceof TypeError ||
       /failed to fetch|network|load failed/i.test(e.message || '');
-    if (esErrorDeRed && intento < 3) {
+    if (esErrorDeRed && intento < 3 && ACCIONES_REINTENTABLES_AUTOMATICAMENTE.has(action)) {
       await new Promise(r => setTimeout(r, intento * 1200));
       return apiCall(action, body, timeoutMs, intento + 1);
     }
-    if (e.name === 'AbortError') throw new Error('El servidor tardó demasiado. Intenta otra vez.');
+    if (e.name === 'AbortError') throw new Error('El servidor tardó demasiado. Es posible que SÍ se haya guardado: revisa antes de volver a intentarlo.');
     throw e;
   }
 }
@@ -5354,8 +5369,43 @@ async function renderTabLog() {
   try {
     const r = await apiCall('admin_ver_log', {});
     const log = r.log || [];
+
+    // Resumen "qué hizo cada asesor hoy/cada día": agrupa por vendedor + fecha
+    // (solo el día, sin hora) y cuenta cuántas veces hizo cada tipo de acción.
+    // OJO: esto solo cubre lo que ya queda registrado en el log (prospectos
+    // creados/editados/eliminados, reasignaciones, descartes...). Llamadas,
+    // recordatorios y ventas todavía no generan una entrada de log — por ahora
+    // ese resumen vive en la pestaña "Hoy"/Agenda, no aquí.
+    const resumen = {};
+    log.forEach(l => {
+      const dia = String(l.fecha || '').slice(0, 10);
+      const clave = (l.vendedor || '—') + '|' + dia;
+      if (!resumen[clave]) resumen[clave] = { vendedor: l.vendedor || '—', dia, acciones: {} };
+      resumen[clave].acciones[l.accion] = (resumen[clave].acciones[l.accion] || 0) + 1;
+    });
+    const filasResumen = Object.values(resumen).sort((a, b) => (b.dia + b.vendedor).localeCompare(a.dia + a.vendedor));
+
     cont.innerHTML = `
       <div class="admin-tip">Últimas ${log.length} acciones</div>
+
+      <h4 style="margin:16px 0 8px">📊 Resumen por asesor y día</h4>
+      <p class="muted" style="font-size:12px;margin:0 0 10px">
+        Solo incluye lo que ya queda registrado en este log (prospectos creados/editados/eliminados, reasignaciones, descartes).
+        Llamadas, recordatorios y ventas todavía no generan una entrada aquí — eso requeriría agregar el registro en el backend.
+      </p>
+      <div class="log-list">
+        ${filasResumen.length === 0 ? '<div class="muted">Sin datos</div>' :
+          filasResumen.map(f => `
+            <div class="log-row">
+              <div class="log-fecha">${escapeHTML(f.dia)}</div>
+              <div class="log-vendedor">${escapeHTML(f.vendedor)}</div>
+              <div class="log-detalles">${Object.entries(f.acciones).map(([a, n]) => `${etiquetaAccion(a)}: <strong>${n}</strong>`).join(' · ')}</div>
+            </div>
+          `).join('')
+        }
+      </div>
+
+      <h4 style="margin:20px 0 8px">📋 Detalle (orden cronológico)</h4>
       <div class="log-list">
         ${log.length === 0 ? '<div class="muted">Sin acciones registradas</div>' :
           log.map(l => `
@@ -5383,6 +5433,14 @@ function etiquetaAccion(a) {
     'crear_usuario': 'Creó usuario',
     'editar_usuario': 'Editó usuario',
     'resetear_password': 'Reseteó contraseña',
+    'captura_rapida': '🌱 Creó prospecto',
+    'editar_captura': '✏️ Editó prospecto',
+    'eliminar_captura': '🗑️ Eliminó prospecto',
+    'asignar_vendedor': '👤 Reasignó cliente',
+    'marcar_descartado': '🚫 Descartó negocio',
+    'quitar_descartado': '↩️ Reactivó negocio',
+    'eliminar_recordatorio': '⏰ Eliminó recordatorio',
+    'siigo_sync': '🔄 Sincronización Siigo',
   };
   return labels[a] || a;
 }
@@ -5759,9 +5817,11 @@ const APP = {
     fecha: '',          // filtrar por fecha exacta de vencimiento (YYYY-MM-DD)
     vendedor: '',       // filtrar por asesor/vendedor
     tipo: 'todos',      // todos | empresa | hogar | distribuidor
+    busqueda: '',       // buscador local de la Agenda
   },
   filtrosHoy: {
     tipo: 'todos',      // todos | empresa | hogar | distribuidor — filtro de la página "A quién contactar hoy"
+    busqueda: '',       // buscador local de la página "Hoy"
   },
   // Cuántas "páginas" de 12 tarjetas se han desplegado en cada sección de "Hoy".
   // Antes la lista se cortaba siempre en los 15/10 más valiosos y el resto de
@@ -6337,7 +6397,7 @@ function renderRecordatoriosSidebar() {
   el.innerHTML = todos.map(r => {
     const c = APP.data.clientes.find(x => x.id === r.clienteId);
     const pr = !c ? (APP.prospectos||[]).find(x => x.id === r.clienteId) : null;
-    const nombre = c ? c.nombre : ('🌱 ' + (pr.empresa || pr.nombre) + (pr.empresa ? ' — ' + pr.nombre : ''));
+    const nombre = c ? c.nombre : ('🌱 ' + (pr.empresa || pr.nombre) + (pr.empresa && pr.nombre ? ' — ' + pr.nombre : ''));
     // Limpiamos la hora con la misma regex defensiva que usa itemRecordatorio(): si la hoja
     // de Sheets devolviera un valor de Fecha/Hora "sucio" en vez de texto, evitamos mostrarlo crudo.
     const horaLimpia = ((r.hora||'').match(/\d{1,2}:\d{2}/)||['09:00'])[0];
@@ -6439,6 +6499,21 @@ document.addEventListener('input', (e) => {
       if (APP.view !== 'clientes') APP.view = 'clientes';
       render();
     }, 200);
+  }
+  // Buscadores locales de Hoy, Agenda y Prospectos — cada uno guarda su propio
+  // texto y vuelve a renderizar solo su vista (no cambian de página como el
+  // buscador principal de arriba, que siempre salta a Clientes).
+  if (e.target.id === 'hoy-buscador') {
+    clearTimeout(busquedaTimer);
+    busquedaTimer = setTimeout(() => { APP.filtrosHoy.busqueda = e.target.value; render(); }, 200);
+  }
+  if (e.target.id === 'agenda-buscador') {
+    clearTimeout(busquedaTimer);
+    busquedaTimer = setTimeout(() => { APP.filtrosAgenda.busqueda = e.target.value; render(); }, 200);
+  }
+  if (e.target.id === 'prospectos-buscador') {
+    clearTimeout(busquedaTimer);
+    busquedaTimer = setTimeout(() => { APP.filtroProspectosBusqueda = e.target.value; render(); }, 200);
   }
 });
 
@@ -7407,7 +7482,7 @@ async function actualizarEtapaProspecto(prospectoId, nuevaEtapa, opts) {
     await apiCall('editar_captura', { id: prospectoId, cambios: { estado: nuevaEtapa } });
     if (!(opts && opts.silencioso)) {
       const et = ETAPAS_EMBUDO.find(e => e.id === nuevaEtapa);
-      mostrarToast('Etapa actualizada: ' + (et ? et.emoji + ' ' + et.label : nuevaEtapa));
+      mostrarToast('Embudo actualizado: ' + (et ? et.emoji + ' ' + et.label : nuevaEtapa));
     }
   } catch (e) {
     // Si falla el guardado remoto, revertimos el cambio local para no mostrar
@@ -7460,7 +7535,7 @@ function accionSeleccionarChip(btn, accionId) {
 function abrirModalRecordatorio(clienteId) {
   const c = APP.data.clientes.find(x => x.id === clienteId);
   const pr = !c ? (APP.prospectos||[]).find(x => x.id === clienteId) : null;
-  const nombreEntidad = c ? c.nombre : (pr ? ((pr.empresa || pr.nombre) + (pr.empresa ? ' — ' + pr.nombre : '')) : 'este contacto');
+  const nombreEntidad = c ? c.nombre : (pr ? ((pr.empresa || pr.nombre) + (pr.empresa && pr.nombre ? ' — ' + pr.nombre : '')) : 'este contacto');
   const modal = document.getElementById('modal-recordatorio');
   const body = document.getElementById('modal-rec-body');
   
@@ -7498,7 +7573,11 @@ function abrirModalRecordatorio(clienteId) {
       ${puede('reasignar_clientes') && (_vendedoresCache||[]).length > 0 ? `
         <label>Asesor:</label>
         <select name="vendedor">
-          ${_vendedoresCache.map(v => `<option value="${escapeHTML(v.nombre)}" ${v.nombre===APP.vendedorActivo?'selected':''}>${escapeHTML(v.nombre)}</option>`).join('')}
+          <!-- El value es el username (no el nombre completo): todo lo demás en la
+               Agenda (filtro, "mis recordatorios" vs "del equipo") compara por
+               username. Guardar el nombre aquí rompía esas comparaciones para
+               quien recibía el recordatorio asignado. -->
+          ${_vendedoresCache.map(v => `<option value="${escapeHTML(v.username)}" ${v.username===((AUTH.user&&AUTH.user.username)||'')?'selected':''}>${escapeHTML(v.nombre)}</option>`).join('')}
         </select>
       ` : ''}
       <div class="modal-actions">
@@ -7538,7 +7617,7 @@ function abrirModalEditarRecordatorio(id) {
   if (!r) { mostrarToast('Ese recordatorio ya no existe (puede que lo hayan borrado)', true); return; }
   const c = APP.data.clientes.find(x => x.id === r.clienteId);
   const pr = !c ? (APP.prospectos||[]).find(x => x.id === r.clienteId) : null;
-  const nombreEntidad = c ? c.nombre : (pr ? ((pr.empresa || pr.nombre) + (pr.empresa ? ' — ' + pr.nombre : '')) : 'este contacto');
+  const nombreEntidad = c ? c.nombre : (pr ? ((pr.empresa || pr.nombre) + (pr.empresa && pr.nombre ? ' — ' + pr.nombre : '')) : 'este contacto');
   const modal = document.getElementById('modal-recordatorio');
   const body = document.getElementById('modal-rec-body');
   const horaMatch = String(r.hora || '').match(/\d{1,2}:\d{2}/);
@@ -7594,21 +7673,30 @@ function abrirModalLlamada(clienteId, obligarRecordatorio, recordatorioIdAComple
   // Ahora también funciona para prospectos (antes solo funcionaba con clientes reales
   // de Siigo y se quedaba en blanco/roto si lo abrías desde un recordatorio de prospecto).
   const pr = !c ? (APP.prospectos||[]).find(x => x.id === clienteId) : null;
-  const nombreMostrar = c ? c.nombre : (pr ? ((pr.empresa || pr.nombre) + (pr.empresa ? ' — ' + pr.nombre : '')) : 'este contacto');
+  const nombreMostrar = c ? c.nombre : (pr ? ((pr.empresa || pr.nombre) + (pr.empresa && pr.nombre ? ' — ' + pr.nombre : '')) : 'este contacto');
   const modal = document.getElementById('modal-llamada');
   const body = document.getElementById('modal-llam-body');
   const ahora = new Date();
   const fechaH = ahora.toISOString().split('T')[0];
   const horaH = ahora.toTimeString().slice(0,5);
-  // Cuando se abre desde el botón "Ya lo contacté" de la página "Hoy", o desde
-  // "Marcar como hecho" en la Agenda, Oscar pidió que sea obligatorio dejar
-  // programado el próximo contacto (no se puede elegir "No"), para que el cliente
-  // no quede sin nadie haciéndole seguimiento.
-  _llamObligarRec = !!obligarRecordatorio;
+  // Oscar pidió que SIEMPRE que se registre contacto con un cliente o prospecto
+  // (sin importar desde qué botón se abrió este modal: "Registrar llamada",
+  // "Ya lo contacté", "Marcar como hecho", "Registrar contacto" de un prospecto...)
+  // quede obligatorio dejar programado el próximo contacto. Ya no depende del
+  // parámetro obligarRecordatorio: siempre es obligatorio. El "paso siguiente"
+  // (la próxima acción / nota) sigue siendo opcional, lo único obligatorio es que
+  // exista el recordatorio con una fecha.
+  _llamObligarRec = true;
   // Si se abrió desde la Agenda para completar un recordatorio puntual, ese
   // recordatorio se marca como hecho al guardar (en vez de quedar pendiente para
   // siempre aunque ya se haya gestionado).
   _llamRecordatorioIdCompletar = recordatorioIdACompletar || null;
+  // Para poder reasignar el asesor desde este mismo modal (antes solo se podía
+  // desde "Programar recordatorio"; Oscar pidió que también se pueda aquí, y que
+  // funcione igual para clientes de Siigo que para prospectos — cada uno guarda
+  // su asignación en un lugar distinto, ver guardarLlamadaRapida).
+  _llamEsClienteSiigo = !!c;
+  _llamVendedorActual = c ? (USER.asignaciones[c.id] || '') : (pr ? canonizarVendedor(pr.vendedor) : '');
 
   const resultados = [
     {emoji:'📞', label:'No contestó'},
@@ -7698,6 +7786,19 @@ function abrirModalLlamada(clienteId, obligarRecordatorio, recordatorioIdAComple
       </div>
     </details>
 
+    ${puede('reasignar_clientes') && (_vendedoresCache||[]).length > 0 ? `
+      <div style="margin-top:10px;">
+        <label style="font-size:.8rem;color:var(--muted,#888);font-weight:600;text-transform:uppercase">Asesor:</label>
+        <!-- Funciona igual para clientes Siigo y para prospectos; el value es
+             siempre el username (ver guardarLlamadaRapida para cómo se guarda
+             cada caso). -->
+        <select id="llam-vendedor" style="width:100%;padding:8px 10px;margin-top:4px;border-radius:8px;border:1px solid var(--border,#ddd);font-size:.9rem;background:var(--bg-input,#f8f8f8);box-sizing:border-box;">
+          <option value="">Sin asignar</option>
+          ${_vendedoresCache.map(v => `<option value="${escapeHTML(v.username)}" ${v.username===_llamVendedorActual?'selected':''}>${escapeHTML(v.nombre)}</option>`).join('')}
+        </select>
+      </div>
+    ` : ''}
+
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">
       <button type="button" class="btn btn-ghost" onclick="llamCancelar()">Cancelar</button>
       <button type="button" class="btn btn-primary" onclick="guardarLlamadaRapida('${escapeHTML(clienteId)}','${fechaH}','${horaH}')">Guardar</button>
@@ -7712,6 +7813,8 @@ let _llamMic = null;
 let _llamGrabando = false;
 let _llamObligarRec = false;
 let _llamRecordatorioIdCompletar = null;
+let _llamEsClienteSiigo = false;
+let _llamVendedorActual = '';
 
 function llamSeleccionarAccion(btn, accionId) {
   const grupo = btn.parentElement;
@@ -7841,6 +7944,26 @@ function guardarLlamadaRapida(clienteId, fechaDef, horaDef) {
     });
   }
 
+  // Reasignar asesor desde aquí mismo, si se cambió el select. Clientes Siigo y
+  // prospectos guardan la asignación en lugares distintos (ver comentario en
+  // abrirModalLlamada), así que cada uno usa su propio camino para grabarlo.
+  const selVendedor = document.getElementById('llam-vendedor');
+  if (selVendedor && selVendedor.value !== _llamVendedorActual) {
+    if (_llamEsClienteSiigo) {
+      asignarVendedor(clienteId, selVendedor.value);
+    } else if (_prospectoDeEstaLlamada) {
+      const opt = selVendedor.options[selVendedor.selectedIndex];
+      const cambiosVendedor = { vendedor: selVendedor.value, vendedorNombre: opt ? opt.textContent : selVendedor.value };
+      apiCall('editar_captura', { id: clienteId, cambios: cambiosVendedor })
+        .then(() => {
+          const idx = (APP.prospectos || []).findIndex(x => x.id === clienteId);
+          if (idx !== -1) Object.assign(APP.prospectos[idx], cambiosVendedor);
+          render();
+        })
+        .catch(err => mostrarToast('No se pudo reasignar el asesor: ' + err.message, true));
+    }
+  }
+
   saveUserData();
   cerrarModal('modal-llamada');
   mostrarToast('✓ Llamada registrada');
@@ -7897,12 +8020,19 @@ function pasaFiltrosAgenda(r) {
   const f = APP.filtrosAgenda;
   if (!f) return true;
   if (f.fecha && r.fecha !== f.fecha) return false;
-  if (f.vendedor && String(r.vendedor || '').toLowerCase() !== f.vendedor.toLowerCase()) return false;
+  if (f.vendedor && canonizarVendedor(r.vendedor) !== f.vendedor.toLowerCase()) return false;
   if (f.tipo && f.tipo !== 'todos') {
     const c = APP.data.clientes.find(x => x.id === r.clienteId);
     const pr = !c ? (APP.prospectos || []).find(x => x.id === r.clienteId) : null;
     const tipoEntidad = c ? tipoEfectivo(c) : (pr ? pr.tipo : '');
     if (String(tipoEntidad || '').toLowerCase() !== f.tipo.toLowerCase()) return false;
+  }
+  if (f.busqueda) {
+    const c = APP.data.clientes.find(x => x.id === r.clienteId);
+    const pr = !c ? (APP.prospectos || []).find(x => x.id === r.clienteId) : null;
+    const nombreEntidad = c ? c.nombre : (pr ? ((pr.empresa || '') + ' ' + (pr.nombre || '')) : '');
+    const q = f.busqueda.toLowerCase();
+    if (!String(nombreEntidad || '').toLowerCase().includes(q) && !String(r.clienteId || '').toLowerCase().includes(q) && !String(r.descripcion || '').toLowerCase().includes(q)) return false;
   }
   return true;
 }
@@ -7913,7 +8043,7 @@ function setFiltroAgenda(campo, valor) {
 }
 
 function limpiarFiltrosAgenda() {
-  APP.filtrosAgenda = { fecha: '', vendedor: '', tipo: 'todos' };
+  APP.filtrosAgenda = { fecha: '', vendedor: '', tipo: 'todos', busqueda: '' };
   render();
 }
 
@@ -7925,9 +8055,12 @@ function renderAgenda(view) {
   // Aplicar filtros (fecha de vencimiento, asesor, tipo de cliente) antes de clasificar
   const filtrados = USER.recordatorios.filter(pasaFiltrosAgenda);
 
-  // Separar propios y del equipo
-  const propios = filtrados.filter(r => !r.completado && (String(r.vendedor||'').toLowerCase() === miUsername || !r.vendedor));
-  const equipo = filtrados.filter(r => !r.completado && r.vendedor && String(r.vendedor||'').toLowerCase() !== miUsername);
+  // Separar propios y del equipo. Se compara por clave canónica (no por el texto
+  // crudo de r.vendedor) porque algunos recordatorios viejos quedaron guardados
+  // con el nombre completo del asesor en vez de su username — comparar literal
+  // hacía que un recordatorio asignado a alguien no le apareciera como "propio".
+  const propios = filtrados.filter(r => !r.completado && (canonizarVendedor(r.vendedor) === miUsername.toLowerCase() || !r.vendedor));
+  const equipo = filtrados.filter(r => !r.completado && r.vendedor && canonizarVendedor(r.vendedor) !== miUsername.toLowerCase());
   
   // Clasificar los propios
   const vencidos = propios.filter(r => r.fecha < hoy);
@@ -7944,21 +8077,22 @@ function renderAgenda(view) {
   deHoy.sort((a,b) => (a.hora||'09:00').localeCompare(b.hora||'09:00'));
   futuros.sort((a,b) => (a.fecha+a.hora).localeCompare(b.fecha+b.hora));
 
-  const f = APP.filtrosAgenda || { fecha: '', vendedor: '', tipo: 'todos' };
+  const f = APP.filtrosAgenda || { fecha: '', vendedor: '', tipo: 'todos', busqueda: '' };
   // Antes esto mezclaba nombres completos (de _vendedoresCache) con usernames
   // crudos (de r.vendedor) en un mismo Set: como son textos distintos para la
   // misma persona ("Oscar Leonardo Sanchez Becerra" vs "oscarsanchez"), salían
   // como dos asesores diferentes en el filtro, y encima elegir el de "nombre"
   // no filtraba nada porque pasaFiltrosAgenda compara contra el username.
-  // Ahora se deduplica por username y se muestra siempre el nombre completo.
+  // Ahora se deduplica por clave canónica (canonizarVendedor), que junta tanto
+  // los usernames crudos como los nombres completos guardados por error.
   const _usernamesAgenda = Array.from(new Set([
-    ...((_vendedoresCache || []).map(u => u.username)),
-    ...USER.recordatorios.map(r => r.vendedor).filter(Boolean),
+    ...((_vendedoresCache || []).map(u => String(u.username).toLowerCase())),
+    ...USER.recordatorios.map(r => canonizarVendedor(r.vendedor)).filter(Boolean),
   ]));
   const vendedoresAgenda = _usernamesAgenda
     .map(u => ({ username: u, label: nombreVendedor(u) || u }))
     .sort((a, b) => a.label.localeCompare(b.label));
-  const filtrosActivos = !!(f.fecha || f.vendedor || (f.tipo && f.tipo !== 'todos'));
+  const filtrosActivos = !!(f.fecha || f.vendedor || f.busqueda || (f.tipo && f.tipo !== 'todos'));
 
   view.innerHTML = `
     <div class="page-head">
@@ -7981,6 +8115,10 @@ function renderAgenda(view) {
     </div>
 
     <div class="filtros-bar">
+      <div class="filtro-grupo">
+        <label>Buscar:</label>
+        <input type="text" id="agenda-buscador" placeholder="🔍 Nombre, NIT/CC o descripción..." value="${escapeHTML(f.busqueda || '')}">
+      </div>
       <div class="filtro-grupo">
         <label>Fecha de vencimiento:</label>
         <input type="date" value="${escapeHTML(f.fecha)}" onchange="setFiltroAgenda('fecha', this.value)">
@@ -8035,12 +8173,12 @@ function renderAgenda(view) {
     </div>
     
     ${completados.length > 0 ? `
-      <div class="card card-completados">
-        <div class="card-head">
-          <h3>✅ Completados recientes</h3>
-        </div>
+      <details class="card card-completados">
+        <summary style="cursor:pointer;list-style:none">
+          <h3 style="display:inline">✅ Completados recientes (${completados.length})</h3>
+        </summary>
         ${completados.map(r => itemRecordatorioSafe(r, false, true)).join('')}
-      </div>
+      </details>
     ` : ''}
 
     ${equipoVencidos.length > 0 ? `
@@ -8140,7 +8278,7 @@ function itemRecordatorio(r, vencido, completado) {
       </div>
     `;
   }
-  const nombreEntidad = c ? c.nombre : ('🌱 ' + (pr.empresa || pr.nombre) + (pr.empresa ? ' — ' + pr.nombre : ''));
+  const nombreEntidad = c ? c.nombre : ('🌱 ' + (pr.empresa || pr.nombre) + (pr.empresa && pr.nombre ? ' — ' + pr.nombre : ''));
   // Extraer "HH:MM" limpio — Sheets puede devolver hora como Date serial ("Sat Dec 30 1899 09:00...")
   const horaLimpia = ((r.hora || '').match(/\d{1,2}:\d{2}/) || ['09:00'])[0].padStart(5, '0');
   const _fd = r.fecha ? r.fecha.substring(0, 10) : '';
@@ -8222,8 +8360,20 @@ function renderProspectos(view) {
   const todosSinFiltrar = APP.prospectos || [];
   const filtroVendedor = APP.filtroProspectosVendedor || '';
   const filtroEtapa = APP.filtroProspectosEtapa || '';
-  let todos = filtroVendedor ? todosSinFiltrar.filter(p => (p.vendedor || '') === filtroVendedor) : todosSinFiltrar;
+  // El filtro se aplica por clave canónica (ver canonizarVendedor) y no por
+  // comparación literal, porque "marthamilena" y "Martha Milena Becerra" deben
+  // contar como el mismo asesor aunque el texto guardado no sea idéntico.
+  let todos = filtroVendedor ? todosSinFiltrar.filter(p => canonizarVendedor(p.vendedor) === filtroVendedor) : todosSinFiltrar;
   if (filtroEtapa) todos = todos.filter(p => etapaDeProspecto(p).id === filtroEtapa);
+  const qProspectos = (APP.filtroProspectosBusqueda || '').trim().toLowerCase();
+  if (qProspectos) {
+    todos = todos.filter(p =>
+      String(p.nombre || '').toLowerCase().includes(qProspectos) ||
+      String(p.empresa || '').toLowerCase().includes(qProspectos) ||
+      String(p.telefono || '').toLowerCase().includes(qProspectos) ||
+      String(p.documento || '').toLowerCase().includes(qProspectos)
+    );
+  }
   const tab = APP.tabProspectos || 'todos';
   const lista = tab === 'todos' ? todos : todos.filter(p => (p.tipo || 'empresa') === tab);
 
@@ -8241,10 +8391,18 @@ function renderProspectos(view) {
     { id: 'distribuidor', label: 'Distribuidor', emoji: '🚚' },
   ];
 
-  // Lista de asesores únicos presentes en los prospectos capturados, para el filtro
+  // Lista de asesores únicos presentes en los prospectos capturados, para el filtro.
+  // Se agrupa por clave canónica (no por el texto crudo de p.vendedor) para que la
+  // misma persona no salga repetida cuando quedó guardada con formatos distintos.
   const asesoresMap = {};
   todosSinFiltrar.forEach(p => {
-    if (p.vendedor) asesoresMap[p.vendedor] = p.vendedorNombre || p.vendedor;
+    if (!p.vendedor) return;
+    const clave = canonizarVendedor(p.vendedor);
+    if (!clave) return;
+    // Prefiere el nombre completo (vendedorNombre o nombreVendedor del username real)
+    // sobre lo que sea que quedó guardado, para mostrar siempre el nombre legible.
+    const etiqueta = nombreVendedor(clave) !== clave ? nombreVendedor(clave) : (p.vendedorNombre || p.vendedor);
+    if (!asesoresMap[clave] || asesoresMap[clave].length < etiqueta.length) asesoresMap[clave] = etiqueta;
   });
   const asesores = Object.keys(asesoresMap).sort((a, b) => asesoresMap[a].localeCompare(asesoresMap[b]));
 
@@ -8267,6 +8425,10 @@ function renderProspectos(view) {
         </button>
       `).join('')}
       <div class="filtro-grupo">
+        <label>Buscar:</label>
+        <input type="text" id="prospectos-buscador" placeholder="🔍 Nombre, empresa, teléfono..." value="${escapeHTML(APP.filtroProspectosBusqueda || '')}">
+      </div>
+      <div class="filtro-grupo">
         <label>Asesor:</label>
         <select onchange="setFiltroProspectosVendedor(this.value)">
           <option value="">Todos</option>
@@ -8274,7 +8436,7 @@ function renderProspectos(view) {
         </select>
       </div>
       <div class="filtro-grupo">
-        <label>Etapa:</label>
+        <label>Embudo:</label>
         <select onchange="setFiltroProspectosEtapa(this.value)">
           <option value="">Todas</option>
           ${ETAPAS_EMBUDO.map(et => `<option value="${et.id}" ${filtroEtapa === et.id ? 'selected' : ''}>${et.emoji} ${escapeHTML(et.label)}</option>`).join('')}
@@ -8300,25 +8462,29 @@ function itemProspecto(p) {
   // hacer clic, en abrirDetalleProspecto.
   const numSeguimientos = ((USER.llamadas && USER.llamadas[p.id]) || []).length;
   const coincidencia = clienteSiigoCoincidente(p);
+  // Los botones de acción van JUNTO al nombre (no en una columna aparte al borde
+  // derecho de la tarjeta): con la lista muy compacta, tener los íconos lejos del
+  // nombre hacía que, al apuntar al botón de una fila, fuera fácil hacer clic en el
+  // de la fila de arriba o abajo por error — incluyendo borrar el contacto equivocado.
   return `
     <div class="prospecto-card" onclick="abrirDetalleProspecto('${escapeHTML(p.id)}')" style="cursor:pointer">
       <div class="prospecto-content">
         <div class="rec-cliente-nom" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
           ${emojiTipo} ${escapeHTML(p.empresa || p.nombre)} ${etapaPillHTML(p)}
+          <span class="prospecto-acciones" onclick="event.stopPropagation()">
+            <button class="btn-icon-text" onclick="abrirModalRecordatorio('${escapeHTML(p.id)}')" title="Programar recordatorio">⏰</button>
+            ${puedeModificar ? `<button class="btn-icon-text" onclick="abrirModalEditarProspecto('${escapeHTML(p.id)}')" title="Editar / reasignar">✏️</button>` : ''}
+            ${puedeModificar ? `<button class="btn-icon-text" onclick="eliminarProspecto('${escapeHTML(p.id)}', this)" title="Eliminar">🗑️</button>` : ''}
+          </span>
         </div>
         <div class="rec-desc-full">${[
-          p.empresa ? '👤 ' + escapeHTML(p.nombre) : '',
+          p.empresa && p.nombre ? '👤 ' + escapeHTML(p.nombre) : '',
           p.telefono ? '📞 ' + escapeHTML(p.telefono) : '',
           'por ' + escapeHTML(p.vendedorNombre || p.vendedor || ''),
           fechaStr,
           numSeguimientos > 0 ? `📋 ${numSeguimientos} seguimiento${numSeguimientos === 1 ? '' : 's'}` : 'sin seguimientos aún',
         ].filter(Boolean).join(' · ')}</div>
         ${coincidencia ? `<div style="margin-top:4px;font-size:12px;color:#16a34a;font-weight:600">🎉 Coincide con cliente Siigo: ${escapeHTML(coincidencia.nombre || coincidencia.id)} — abre y confirma la conversión</div>` : ''}
-      </div>
-      <div class="prospecto-acciones">
-        <button class="btn-icon-text" onclick="event.stopPropagation(); abrirModalRecordatorio('${escapeHTML(p.id)}')" title="Programar recordatorio">⏰</button>
-        ${puedeModificar ? `<button class="btn-icon-text" onclick="event.stopPropagation(); abrirModalEditarProspecto('${escapeHTML(p.id)}')" title="Editar / reasignar">✏️</button>` : ''}
-        ${puedeModificar ? `<button class="btn-icon-text" onclick="event.stopPropagation(); eliminarProspecto('${escapeHTML(p.id)}', this)" title="Eliminar">🗑️</button>` : ''}
       </div>
     </div>
   `;
@@ -8371,7 +8537,7 @@ function renderDetalleProspecto(p) {
     <div style="display:flex;justify-content:space-between;align-items:start;gap:10px">
       <div>
         <h3 style="margin:0 0 4px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">${emojiTipo} ${escapeHTML(p.empresa || p.nombre)} ${etapaPillHTML(p)}</h3>
-        ${p.empresa ? `<div class="muted" style="font-size:13px">👤 ${escapeHTML(p.nombre)}</div>` : ''}
+        ${p.empresa && p.nombre ? `<div class="muted" style="font-size:13px">👤 ${escapeHTML(p.nombre)}</div>` : ''}
       </div>
       <button class="btn-icon-text" onclick="cerrarModal('modal-detalle-prospecto')" title="Cerrar">✕</button>
     </div>
@@ -8470,6 +8636,10 @@ function renderHoy(view) {
   );
   const sinGestionar = c => !idsConRecordatorioActivo.has(c.id);
   const pasaTipo = c => tipoFiltroHoy === 'todos' || tipoEfectivo(c) === tipoFiltroHoy;
+  // Buscador local: por nombre o NIT/CC, para encontrar un cliente puntual sin
+  // tener que recorrer las 4 listas a ojo.
+  const qHoy = (APP.filtrosHoy.busqueda || '').trim().toLowerCase();
+  const pasaBusquedaHoy = c => !qHoy || String(c.nombre || '').toLowerCase().includes(qHoy) || String(c.id || '').toLowerCase().includes(qHoy);
   // Negocios marcados como "cerrado / ya no existe": Oscar pidió sacarlos para siempre
   // de esta lista porque varias empresas del listado ya cerraron.
   const noDescartado = c => !(USER.descartados && USER.descartados[c.id]);
@@ -8477,7 +8647,7 @@ function renderHoy(view) {
   // 1. Clientes que tocan llamar (estado="toca")
   const tocan = clientes.filter(c => c.estado === 'toca')
     .filter(c => !APP.filtros.soloMios || USER.asignaciones[c.id] === APP.vendedorActivo)
-    .filter(pasaTipo).filter(sinGestionar).filter(noDescartado)
+    .filter(pasaTipo).filter(sinGestionar).filter(noDescartado).filter(pasaBusquedaHoy)
     .sort((a,b) => b.total - a.total);
 
   // 2. Atrasados — antes solo entraban los de más de $500.000 y se ignoraba al resto.
@@ -8486,19 +8656,19 @@ function renderHoy(view) {
   // una lista gigante de un solo golpe.
   const atrasados = clientes.filter(c => c.estado === 'atrasado')
     .filter(c => !APP.filtros.soloMios || USER.asignaciones[c.id] === APP.vendedorActivo)
-    .filter(pasaTipo).filter(sinGestionar).filter(noDescartado)
+    .filter(pasaTipo).filter(sinGestionar).filter(noDescartado).filter(pasaBusquedaHoy)
     .sort((a,b) => b.total - a.total);
 
   // 3. En riesgo (antes solo >$1M)
   const riesgoVip = clientes.filter(c => c.estado === 'riesgo')
     .filter(c => !APP.filtros.soloMios || USER.asignaciones[c.id] === APP.vendedorActivo)
-    .filter(pasaTipo).filter(sinGestionar).filter(noDescartado)
+    .filter(pasaTipo).filter(sinGestionar).filter(noDescartado).filter(pasaBusquedaHoy)
     .sort((a,b) => b.total - a.total);
 
   // 4. Perdidos (antes solo >$2M)
   const perdidosVip = clientes.filter(c => c.estado === 'perdido')
     .filter(c => !APP.filtros.soloMios || USER.asignaciones[c.id] === APP.vendedorActivo)
-    .filter(pasaTipo).filter(sinGestionar).filter(noDescartado)
+    .filter(pasaTipo).filter(sinGestionar).filter(noDescartado).filter(pasaBusquedaHoy)
     .sort((a,b) => b.total - a.total);
 
   // Contador "Llevas X de Y hoy": Y = todos los pendientes de hoy (antes de paginar),
@@ -8542,6 +8712,7 @@ function renderHoy(view) {
         ` : ''}
       </div>
       <div class="page-actions">
+        <input type="text" id="hoy-buscador" placeholder="🔍 Buscar por nombre o NIT/CC..." value="${escapeHTML(APP.filtrosHoy.busqueda || '')}" style="padding:8px 12px;border-radius:8px;border:1px solid var(--bord);background:var(--bg-card);color:var(--text);font-size:13px;min-width:200px">
         <select onchange="cambiarFiltroTipoHoy(this.value)" style="padding:8px 12px;border-radius:8px;border:1px solid var(--bord);background:var(--bg-card);color:var(--text);font-size:13px;">
           <option value="todos" ${tipoFiltroHoy==='todos'?'selected':''}>Todos los tipos</option>
           <option value="empresa" ${tipoFiltroHoy==='empresa'?'selected':''}>🏢 Empresa</option>
@@ -8553,7 +8724,7 @@ function renderHoy(view) {
         </button>
       </div>
     </div>
-    
+
     ${tocan.length > 0 ? `
       <div class="card">
         <div class="card-head">
@@ -8805,6 +8976,22 @@ function nombreVendedor(username) {
   return u && u.nombre ? u.nombre : username;
 }
 
+// El campo "vendedor" de un prospecto a veces quedó guardado como username
+// ("marthamilena") y otras veces como nombre completo ("Martha Milena Becerra"),
+// según qué pantalla lo creó. Esto hacía que el filtro de Asesor mostrara a la
+// misma persona dos (o más) veces. Esta función junta ambas formas bajo una
+// sola clave (el username, si lo encontramos en la lista de usuarios), para
+// que el filtro las trate como un solo asesor.
+function canonizarVendedor(raw) {
+  if (!raw) return '';
+  const rawLower = String(raw).trim().toLowerCase();
+  const match = (_usuariosCache || []).find(u =>
+    String(u.username || '').toLowerCase() === rawLower || String(u.nombre || '').toLowerCase() === rawLower
+  );
+  // Siempre en minúsculas para que la comparación no dependa de mayúsculas/minúsculas.
+  return match ? String(match.username).toLowerCase() : rawLower;
+}
+
 // Teléfono de un cliente real o de un prospecto, para mostrarlo junto al recordatorio.
 function telefonoEntidad(c, pr) {
   if (c && c.telefonos && c.telefonos.length > 0) {
@@ -8837,7 +9024,7 @@ function notificarRecordatorio(r) {
   // función se salía aquí sin avisar nada — el recordatorio "sonaba" pero nadie lo veía.
   const pr = !c ? (APP.prospectos||[]).find(x => x.id === r.clienteId) : null;
   if (!c && !pr) return; // El cliente/prospecto fue eliminado: no hay nada que notificar.
-  const nombreEntidad = c ? c.nombre : ('🌱 ' + (pr.empresa || pr.nombre) + (pr.empresa ? ' — ' + pr.nombre : ''));
+  const nombreEntidad = c ? c.nombre : ('🌱 ' + (pr.empresa || pr.nombre) + (pr.empresa && pr.nombre ? ' — ' + pr.nombre : ''));
   
   // Sonido
   if (USER.configuracion.sonidoRecordatorio) {
@@ -11068,7 +11255,7 @@ window.addEventListener('load', () => {
     <!-- Campos -->
     <div class="cv-campos">
       <div class="cv-campo">
-        <label>Nombre</label>
+        <label>Nombre (opcional si ya pusiste la empresa)</label>
         <input id="cv-nombre" type="text" placeholder="Nombre del contacto">
       </div>
       <div class="cv-campo">
@@ -11099,6 +11286,17 @@ window.addEventListener('load', () => {
           <option value="hogar">🏠 Hogar</option>
           <option value="distribuidor">🚚 Distribuidor</option>
         </select>
+      </div>
+      <div class="cv-campo">
+        <label>Embudo de ventas:</label>
+        <div id="cv-etapa-chips" style="display:flex;gap:6px;flex-wrap:wrap">
+          <button type="button" class="accion-chip etapa-chip activo" onclick="cvSeleccionarEtapa(this, 'sin_contacto')" data-etapa="sin_contacto">⚪ Sin contacto</button>
+          <button type="button" class="accion-chip etapa-chip" onclick="cvSeleccionarEtapa(this, 'contactado')" data-etapa="contactado">🔵 Contactado</button>
+          <button type="button" class="accion-chip etapa-chip" onclick="cvSeleccionarEtapa(this, 'cotizado')" data-etapa="cotizado">🟠 Cotizado</button>
+          <button type="button" class="accion-chip etapa-chip" onclick="cvSeleccionarEtapa(this, 'ganado')" data-etapa="ganado">🟢 Ganado</button>
+          <button type="button" class="accion-chip etapa-chip" onclick="cvSeleccionarEtapa(this, 'perdido')" data-etapa="perdido">🔴 Perdido</button>
+        </div>
+        <input type="hidden" id="cv-estado" value="sin_contacto">
       </div>
       <div class="cv-campo">
         <label>Asesor</label>
@@ -11336,6 +11534,14 @@ async function cvCargarVendedores() {
   }
 }
 
+function cvSeleccionarEtapa(btn, etapaId) {
+  const grupo = btn.parentElement;
+  grupo.querySelectorAll('.etapa-chip').forEach(b => b.classList.remove('activo'));
+  btn.classList.add('activo');
+  const hidden = document.getElementById('cv-estado');
+  if (hidden) hidden.value = etapaId;
+}
+
 function cvToggleMic() {
   if (_cvGrabando) {
     cvDetenerMic();
@@ -11539,7 +11745,10 @@ function cvDetectarRecordatorio(t) {
 
 async function cvGuardar() {
   const nombre = document.getElementById('cv-nombre').value.trim();
-  if (!nombre) { mostrarToast('Escribe o dicta al menos el nombre', true); return; }
+  const empresaCv = document.getElementById('cv-empresa').value.trim();
+  // El nombre de la persona ya no es obligatorio: a veces solo se sabe la empresa.
+  // Pero hace falta AL MENOS uno de los dos para poder identificar al prospecto.
+  if (!nombre && !empresaCv) { mostrarToast('Escribe al menos el nombre o la empresa', true); return; }
   if (!document.getElementById('cv-tipo').value) { mostrarToast('Selecciona el tipo de prospecto (empresa, hogar o distribuidor)', true); return; }
 
   // Evita que dar varios clics seguidos (porque no se veia ningun aviso de "guardando")
@@ -11594,13 +11803,13 @@ async function cvGuardar() {
   if (quiereRecordatorio && fechaRec) {
     datos.recordatorioFecha = fechaRec;
     datos.recordatorioHora = document.getElementById('cv-recordatorio-hora').value || '09:00';
-    datos.recordatorioNota = document.getElementById('cv-recordatorio-nota').value.trim() || ('Seguimiento a ' + nombre);
+    datos.recordatorioNota = document.getElementById('cv-recordatorio-nota').value.trim() || ('Seguimiento a ' + (nombre || empresaCv));
   }
 
   if (btnGuardarCv) { btnGuardarCv.disabled = true; btnGuardarCv.textContent = '⏳ Guardando...'; }
   try {
     const r = await apiCall('captura_rapida', { datos });
-    mostrarToast('✓ Prospecto guardado: ' + nombre + (r && r.recordatorio ? ' (con recordatorio)' : ''));
+    mostrarToast('✓ Prospecto guardado: ' + (nombre || empresaCv) + (r && r.recordatorio ? ' (con recordatorio)' : ''));
 
     // Reflejar de inmediato en la app, sin esperar a la próxima recarga
     if (r && r.id) {
@@ -11620,6 +11829,15 @@ async function cvGuardar() {
         fecha: new Date().toISOString(),
         estado: 'prospecto',
       });
+      // El backend siempre crea la captura en estado "prospecto" (sin contacto).
+      // Si el vendedor ya eligió una etapa distinta en los botoncitos (ej. porque
+      // la llamada que origina este prospecto ya terminó en cotización), la
+      // aplicamos enseguida con el mismo mecanismo de editar_captura — sin tocar
+      // el backend de creación.
+      const etapaElegidaCv = (document.getElementById('cv-estado') || {}).value || 'sin_contacto';
+      if (etapaElegidaCv !== 'sin_contacto') {
+        actualizarEtapaProspecto(r.id, etapaElegidaCv, { silencioso: true });
+      }
     }
     if (r && r.recordatorio) {
       USER.recordatorios.push(r.recordatorio);
@@ -11655,6 +11873,14 @@ function cvLimpiar() {
   });
   const campos = document.getElementById('cv-recordatorio-campos');
   if (campos) campos.style.display = 'none';
+  // Reiniciar la selección de etapa del embudo a "Sin contacto" (valor por defecto
+  // al crear un prospecto desde cero).
+  const estadoHidden = document.getElementById('cv-estado');
+  if (estadoHidden) estadoHidden.value = 'sin_contacto';
+  const chipsCv = document.getElementById('cv-etapa-chips');
+  if (chipsCv) {
+    chipsCv.querySelectorAll('.etapa-chip').forEach(b => b.classList.toggle('activo', b.dataset.etapa === 'sin_contacto'));
+  }
   _cvTextoCompleto = '';
   cvDetenerMic();
 }
@@ -11679,7 +11905,7 @@ async function abrirModalEditarProspecto(id) {
   const modal = document.getElementById('modal-editar-prospecto');
   const body = document.getElementById('modal-editar-prospecto-body');
 
-  body.innerHTML = `<h3 style="margin:0 0 14px">Editando: ${escapeHTML(p.nombre)}</h3><p class="muted">Cargando...</p>`;
+  body.innerHTML = `<h3 style="margin:0 0 14px">Editando: ${escapeHTML(p.nombre || p.empresa || 'prospecto')}</h3><p class="muted">Cargando...</p>`;
   modal.classList.add('active');
 
   // Si el usuario puede reasignar, traemos la lista de vendedores activos
@@ -11704,10 +11930,10 @@ async function abrirModalEditarProspecto(id) {
   const etapaActual = etapaDeProspecto(p).id;
 
   body.innerHTML = `
-    <h3 style="margin:0 0 14px">Editando: ${escapeHTML(p.nombre)}</h3>
+    <h3 style="margin:0 0 14px">Editando: ${escapeHTML(p.nombre || p.empresa || 'prospecto')}</h3>
     <form id="form-editar-prospecto" onsubmit="guardarEdicionProspecto(event, '${escapeHTML(id)}')">
-      <label>Nombre:</label>
-      <input type="text" name="nombre" required value="${escapeHTML(p.nombre || '')}">
+      <label>Nombre (opcional si hay empresa):</label>
+      <input type="text" name="nombre" value="${escapeHTML(p.nombre || '')}">
       <label>Empresa:</label>
       <input type="text" name="empresa" value="${escapeHTML(p.empresa || '')}">
       <label>Teléfono:</label>
@@ -11728,7 +11954,7 @@ async function abrirModalEditarProspecto(id) {
         <option value="hogar" ${p.tipo === 'hogar' ? 'selected' : ''}>🏠 Hogar</option>
         <option value="distribuidor" ${p.tipo === 'distribuidor' ? 'selected' : ''}>🚚 Distribuidor</option>
       </select>
-      <label>Etapa en el embudo de ventas:</label>
+      <label>Embudo de ventas:</label>
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
         ${ETAPAS_EMBUDO.map(et => `
           <button type="button" class="accion-chip etapa-chip ${etapaActual === et.id ? 'activo' : ''}"
@@ -11771,6 +11997,12 @@ async function guardarEdicionProspecto(e, id) {
   e.preventDefault();
   const f = e.target;
   const p = (APP.prospectos || []).find(x => x.id === id);
+  // El nombre de la persona es opcional, pero hace falta al menos el nombre o la
+  // empresa para poder identificar al prospecto en las listas.
+  if (!f.nombre.value.trim() && !f.empresa.value.trim()) {
+    mostrarToast('Escribe al menos el nombre o la empresa', true);
+    return;
+  }
   const cambios = {
     nombre: f.nombre.value.trim(),
     empresa: f.empresa.value.trim(),
@@ -11820,7 +12052,7 @@ async function guardarEdicionProspecto(e, id) {
 
 async function eliminarProspecto(id, btn) {
   const p = (APP.prospectos || []).find(x => x.id === id);
-  const nombre = p ? p.nombre : 'este prospecto';
+  const nombre = p ? (p.nombre || p.empresa || 'este prospecto') : 'este prospecto';
   if (!confirm(`¿Eliminar a ${nombre}? Esta acción no se puede deshacer. También se borrarán sus recordatorios, notas y llamadas.`)) return;
 
   // Evita que varios clics seguidos (mientras se espera respuesta del servidor)
