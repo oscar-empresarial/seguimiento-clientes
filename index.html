@@ -4366,7 +4366,9 @@ async function cargarDatosUsuario() {
     // Negocios marcados como "cerrado / ya no existe" — se sacan para siempre de
     // "A quien contactar hoy" sin borrar su historial de compras ni facturas.
     USER.descartados = r.descartados || {};
-    
+    // Embudo de ventas para clientes Siigo sin compras todavia (o ya perdidos).
+    USER.etapasClientes = r.etapasClientes || {};
+
     // Si hay un guardado pendiente (debounce activo O una solicitud ya en camino al
     // servidor todavia sin confirmar), NO sobrescribir campos locales. Antes solo se
     // revisaba _guardarTimer, pero ese se pone en null apenas arranca la llamada de red
@@ -6381,7 +6383,7 @@ function renderRecordatoriosSidebar() {
   // de Agenda). Los recordatorios sin vendedor asignado se cuentan como propios.
   const todos = USER.recordatorios
     .filter(r => !r.completado)
-    .filter(r => !r.vendedor || String(r.vendedor||'').toLowerCase() === miUsername.toLowerCase())
+    .filter(r => !r.vendedor || canonizarVendedor(r.vendedor) === miUsername.toLowerCase())
     .filter(r => new Date((r.fecha||'').substring(0,10) + 'T' + ((r.hora||'').match(/\d{1,2}:\d{2}/)||['09:00'])[0].padStart(5,'0')) >= new Date(ahora.getTime() - 60*60*1000))
     // Si el cliente o prospecto al que apunta este recordatorio ya fue eliminado, queda
     // "huerfano": no lo mostramos (antes se mostraba el ID crudo, ej. "901332326" o "cap_...").
@@ -7035,6 +7037,17 @@ function renderCliente(view) {
               </button>
             `}
           </div>
+          ${clienteElegibleEmbudo(c) ? `
+            <div class="ch-embudo" style="margin-top:10px">
+              <label style="display:block;margin-bottom:6px">Embudo de ventas (cliente sin compras todavía):</label>
+              <div style="display:flex;gap:6px;flex-wrap:wrap">
+                ${ETAPAS_EMBUDO.map(et => `
+                  <button type="button" class="accion-chip etapa-chip ${etapaDeCliente(c).id === et.id ? 'activo' : ''}"
+                    onclick="actualizarEtapaCliente('${escapeHTML(c.id)}', '${et.id}')" data-etapa="${et.id}">${et.emoji} ${escapeHTML(et.label)}</button>
+                `).join('')}
+              </div>
+            </div>
+          ` : ''}
         </div>
       </div>
     </div>
@@ -7492,6 +7505,58 @@ async function actualizarEtapaProspecto(prospectoId, nuevaEtapa, opts) {
   }
 }
 
+// ============================================================
+// EMBUDO DE VENTAS para clientes Siigo SIN COMPRAS o ya PERDIDOS.
+// Oscar pidió esto explícitamente ("si, para sin compras y para perdidos"):
+// un cliente real de Siigo que todavía no factura nada es, en la práctica,
+// igual de "prospecto" que uno de CapturaRapida, y uno marcado como
+// "negocio cerrado" (descartado) es justo la etapa 'perdido'. El resto de
+// clientes Siigo (con compras) NO usan esto: siguen con su propio semáforo.
+// ============================================================
+function clienteElegibleEmbudo(c) {
+  return !!c && (Number(c.total) === 0 || !!USER.descartados[c.id]);
+}
+
+function etapaDeCliente(c) {
+  // Si está marcado como descartado (negocio cerrado) manda esa señal aunque
+  // EtapasClientes todavía no se haya actualizado (p.ej. lo descartaron desde
+  // el botón viejo de "negocio cerrado" antes de que existiera el embudo).
+  if (USER.descartados[c.id]) return ETAPAS_EMBUDO.find(e => e.id === 'perdido');
+  const id = (USER.etapasClientes && USER.etapasClientes[c.id]) || 'sin_contacto';
+  return ETAPAS_EMBUDO.find(e => e.id === id) || ETAPAS_EMBUDO[0];
+}
+
+// Mismo patrón que actualizarEtapaProspecto, pero contra la acción nueva
+// actualizar_etapa_cliente (hoja EtapasClientes). El backend ya sincroniza
+// 'perdido' <-> ClientesDescartados, así que aquí solo reflejamos en local
+// lo mínimo para que la pantalla no parpadee mientras llega la respuesta.
+async function actualizarEtapaCliente(clienteId, nuevaEtapa, opts) {
+  const etapaAnterior = (USER.etapasClientes && USER.etapasClientes[clienteId]) || 'sin_contacto';
+  if (etapaAnterior === nuevaEtapa) return;
+  USER.etapasClientes = USER.etapasClientes || {};
+  USER.etapasClientes[clienteId] = nuevaEtapa;
+  const eraDescartado = !!USER.descartados[clienteId];
+  if (nuevaEtapa === 'perdido') {
+    USER.descartados[clienteId] = { motivo: 'Perdido (embudo)', fecha: new Date().toISOString() };
+  } else if (eraDescartado) {
+    delete USER.descartados[clienteId];
+  }
+  try {
+    await apiCall('actualizar_etapa_cliente', { clienteId, etapa: nuevaEtapa });
+    if (!(opts && opts.silencioso)) {
+      const et = ETAPAS_EMBUDO.find(e => e.id === nuevaEtapa);
+      mostrarToast('Embudo actualizado: ' + (et ? et.emoji + ' ' + et.label : nuevaEtapa));
+    }
+    render();
+  } catch (e) {
+    // Revertir si falla el guardado remoto, igual que con prospectos.
+    USER.etapasClientes[clienteId] = etapaAnterior;
+    if (eraDescartado) USER.descartados[clienteId] = { motivo: 'Perdido (embudo)' }; else delete USER.descartados[clienteId];
+    mostrarToast('No se pudo actualizar la etapa: ' + e.message, true);
+    render();
+  }
+}
+
 // Normaliza un NIT/CC para comparar: solo dígitos, sin dígito de verificación
 // (todo lo que viene después de un guión, igual que normalizarIdentificacion en el backend).
 function normalizarDocumentoFE(doc) {
@@ -7555,7 +7620,7 @@ function abrirModalRecordatorio(clienteId) {
         ${yaTiene.map(r => `<li>${escapeHTML(fmtDate(r.fecha))}${r.descripcion ? ' — ' + escapeHTML(r.descripcion) : ''}
           <a href="javascript:void(0)" onclick="cerrarModal('modal-recordatorio'); abrirModalEditarRecordatorio('${escapeHTML(r.id)}')">(editar este)</a></li>`).join('')}
       </ul>
-      Si programas uno nuevo, quedarán los dos activos a la vez.
+      Si programas uno nuevo, este lo reemplaza (no se permiten dos pendientes a la vez sobre el mismo contacto).
     </div>
   ` : '';
 
@@ -7605,10 +7670,16 @@ function guardarRecordatorio(e, clienteId) {
     completado: false,
     notificado: false,
   };
+  // No permitir dos recordatorios pendientes a la vez sobre el mismo cliente/prospecto:
+  // el nuevo reemplaza a los que estuvieran sin completar (ya se le avisó arriba en el
+  // modal si había alguno, esto es lo que hace que ese aviso sea un límite real y no
+  // solo informativo).
+  const habiaDuplicado = (USER.recordatorios || []).some(r => r.clienteId === clienteId && !r.completado);
+  USER.recordatorios = (USER.recordatorios || []).filter(r => !(r.clienteId === clienteId && !r.completado));
   USER.recordatorios.push(rec);
   saveUserData();
   cerrarModal('modal-recordatorio');
-  mostrarToast('✓ Recordatorio programado');
+  mostrarToast(habiaDuplicado ? '✓ Recordatorio actualizado (reemplazó al que estaba pendiente)' : '✓ Recordatorio programado');
   render();
 }
 
@@ -7696,7 +7767,10 @@ function abrirModalLlamada(clienteId, obligarRecordatorio, recordatorioIdAComple
   // funcione igual para clientes de Siigo que para prospectos — cada uno guarda
   // su asignación en un lugar distinto, ver guardarLlamadaRapida).
   _llamEsClienteSiigo = !!c;
-  _llamVendedorActual = c ? (USER.asignaciones[c.id] || '') : (pr ? canonizarVendedor(pr.vendedor) : '');
+  // Canonizado a username (ver canonizarVendedor) para que el "selected" del <select>
+  // de abajo coincida sin importar si lo que está guardado es el nombre completo
+  // (clientes Siigo) o el username (prospectos).
+  _llamVendedorActual = c ? canonizarVendedor(USER.asignaciones[c.id] || '') : (pr ? canonizarVendedor(pr.vendedor) : '');
 
   const resultados = [
     {emoji:'📞', label:'No contestó'},
@@ -7930,6 +8004,10 @@ function guardarLlamadaRapida(clienteId, fechaDef, horaDef) {
   if (dias > 0) {
     const fechaRec = new Date();
     fechaRec.setDate(fechaRec.getDate() + dias);
+    // No permitir que un mismo cliente/prospecto quede con dos recordatorios
+    // pendientes a la vez (Oscar reportó que a "Fitness People" le quedaron 2):
+    // si ya tenía uno sin completar, este lo reemplaza en vez de sumarse.
+    USER.recordatorios = (USER.recordatorios || []).filter(r => !(r.clienteId === clienteId && !r.completado));
     USER.recordatorios.push({
       id: 'r_' + Date.now() + '_' + Math.random().toString(36).slice(2,7),
       clienteId,
@@ -7950,7 +8028,15 @@ function guardarLlamadaRapida(clienteId, fechaDef, horaDef) {
   const selVendedor = document.getElementById('llam-vendedor');
   if (selVendedor && selVendedor.value !== _llamVendedorActual) {
     if (_llamEsClienteSiigo) {
-      asignarVendedor(clienteId, selVendedor.value);
+      // El selector de abajo usa username como value (igual que en Programar
+      // recordatorio), pero la asignación de clientes Siigo (USER.asignaciones /
+      // hoja "Asignaciones", y el filtro "Solo míos") está guardada en formato
+      // NOMBRE COMPLETO en todo el resto de la app (ver el <select> de "Vendedor
+      // asignado" en la ficha de cliente). Hay que convertir aquí para no romper
+      // ese filtro guardando un username donde se espera un nombre.
+      const opt = selVendedor.options[selVendedor.selectedIndex];
+      const nombreVend = selVendedor.value ? (opt ? opt.textContent : nombreVendedor(selVendedor.value)) : '';
+      asignarVendedor(clienteId, nombreVend);
     } else if (_prospectoDeEstaLlamada) {
       const opt = selVendedor.options[selVendedor.selectedIndex];
       const cambiosVendedor = { vendedor: selVendedor.value, vendedorNombre: opt ? opt.textContent : selVendedor.value };
@@ -8455,7 +8541,10 @@ function itemProspecto(p) {
   const emojiTipo = p.tipo === 'hogar' ? '🏠' : (p.tipo === 'distribuidor' ? '🚚' : '🏢');
   const fechaStr = p.fecha ? new Date(p.fecha).toLocaleDateString('es-CO', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
   const miUsername = (AUTH.user && AUTH.user.username) || '';
-  const esMio = String(p.vendedor || '').toLowerCase() === miUsername.toLowerCase();
+  // Comparación por clave canónica (ver canonizarVendedor): p.vendedor puede tener
+  // guardado el username o el nombre completo según qué pantalla lo asignó, y
+  // compararlo literal hacía que el dueño real no pudiera editar/borrar lo suyo.
+  const esMio = canonizarVendedor(p.vendedor) === miUsername.toLowerCase();
   const puedeModificar = esMio || puede('ver_todos_clientes');
   // Tarjeta resumida: lo mínimo para identificar al prospecto. Todo el detalle
   // (trazabilidad de contactos, productos hablados, dirección, etc.) se ve al
@@ -8516,7 +8605,10 @@ function renderDetalleProspecto(p) {
   const emojiTipo = p.tipo === 'hogar' ? '🏠' : (p.tipo === 'distribuidor' ? '🚚' : '🏢');
   const fechaStr = p.fecha ? new Date(p.fecha).toLocaleDateString('es-CO', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
   const miUsername = (AUTH.user && AUTH.user.username) || '';
-  const esMio = String(p.vendedor || '').toLowerCase() === miUsername.toLowerCase();
+  // Comparación por clave canónica (ver canonizarVendedor): p.vendedor puede tener
+  // guardado el username o el nombre completo según qué pantalla lo asignó, y
+  // compararlo literal hacía que el dueño real no pudiera editar/borrar lo suyo.
+  const esMio = canonizarVendedor(p.vendedor) === miUsername.toLowerCase();
   const puedeModificar = esMio || puede('ver_todos_clientes');
 
   const llamadas = (USER.llamadas && USER.llamadas[p.id]) || [];
@@ -8970,9 +9062,19 @@ function _limpiarNotificadosLocalHuerfanos() {
 }
 
 // Nombre completo del asesor a partir del username (cae al username si no se encuentra).
+// IMPORTANTE: _usuariosCache solo se llena cuando se abre el panel de Admin
+// (admin_listar_usuarios requiere permiso admin_usuarios), así que para
+// vendedores normales casi siempre está vacío. _vendedoresCache en cambio se
+// carga para TODOS al iniciar sesión (listar_vendedores no pide permiso
+// especial), así que es la fuente confiable; _usuariosCache solo se usa como
+// extra cuando ya está disponible (por ejemplo, para reconocer a alguien que
+// quedó inactivo y por eso ya no sale en _vendedoresCache).
 function nombreVendedor(username) {
   if (!username) return '';
-  const u = (_usuariosCache || []).find(x => x.username === username);
+  const lower = String(username).toLowerCase();
+  const v = (_vendedoresCache || []).find(x => String(x.username || '').toLowerCase() === lower);
+  if (v && v.nombre) return v.nombre;
+  const u = (_usuariosCache || []).find(x => String(x.username || '').toLowerCase() === lower);
   return u && u.nombre ? u.nombre : username;
 }
 
@@ -8985,11 +9087,15 @@ function nombreVendedor(username) {
 function canonizarVendedor(raw) {
   if (!raw) return '';
   const rawLower = String(raw).trim().toLowerCase();
-  const match = (_usuariosCache || []).find(u =>
-    String(u.username || '').toLowerCase() === rawLower || String(u.nombre || '').toLowerCase() === rawLower
-  );
+  const listas = [_vendedoresCache, _usuariosCache];
+  for (let i = 0; i < listas.length; i++) {
+    const match = (listas[i] || []).find(u =>
+      String(u.username || '').toLowerCase() === rawLower || String(u.nombre || '').toLowerCase() === rawLower
+    );
+    if (match) return String(match.username).toLowerCase();
+  }
   // Siempre en minúsculas para que la comparación no dependa de mayúsculas/minúsculas.
-  return match ? String(match.username).toLowerCase() : rawLower;
+  return rawLower;
 }
 
 // Teléfono de un cliente real o de un prospecto, para mostrarlo junto al recordatorio.
