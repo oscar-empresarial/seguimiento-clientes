@@ -7457,9 +7457,22 @@ function etapaDeProspecto(p) {
   return ETAPAS_EMBUDO.find(e => e.id === id) || ETAPAS_EMBUDO[0];
 }
 
-function etapaPillHTML(p) {
-  const et = etapaDeProspecto(p);
+function pillEtapaHTML(et) {
+  if (!et) return '';
   return `<span class="tipo-pill" style="background:${et.color}22;color:${et.color};border:1px solid ${et.color}55;font-weight:600">${et.emoji} ${escapeHTML(et.label)}</span>`;
+}
+
+function etapaPillHTML(p) {
+  return pillEtapaHTML(etapaDeProspecto(p));
+}
+
+// Badge de embudo para usar donde aparece un cliente o un prospecto indistintamente
+// (Agenda, Hoy, modal de llamada). Devuelve '' si no aplica (cliente con compras y
+// no descartado, que sigue con su propio semáforo y no con el embudo).
+function badgeEmbudoEntidad(c, pr) {
+  if (pr) return pillEtapaHTML(etapaDeProspecto(pr));
+  if (c && clienteElegibleEmbudo(c)) return pillEtapaHTML(etapaDeCliente(c));
+  return '';
 }
 
 // Mapeo: qué etapa del embudo se activa según el botón de "Resultado de la
@@ -7784,7 +7797,7 @@ function abrirModalLlamada(clienteId, obligarRecordatorio, recordatorioIdAComple
   ];
 
   body.innerHTML = `
-    <h3 style="margin:0 0 14px">📞 ${escapeHTML(nombreMostrar)}</h3>
+    <h3 style="margin:0 0 14px">📞 ${escapeHTML(nombreMostrar)}${badgeEmbudoEntidad(c, pr)}</h3>
     ${_llamRecordatorioIdCompletar ? `<p style="font-size:.85rem;color:var(--muted,#888);margin:0 0 10px">Vas a marcar este seguimiento como hecho. Cuenta qué pasó y qué sigue.</p>` : ''}
 
     <p style="font-size:.8rem;color:var(--muted,#888);margin:0 0 8px">Resultado de la llamada:</p>
@@ -7981,13 +7994,18 @@ function guardarLlamadaRapida(clienteId, fechaDef, horaDef) {
   if (!USER.llamadas[clienteId]) USER.llamadas[clienteId] = [];
   USER.llamadas[clienteId].push(llamada);
 
-  // Si el contacto registrado es de un prospecto (no un cliente real de Siigo),
-  // el resultado elegido también mueve su etapa en el embudo de ventas — para
-  // que no quede solo como texto en el historial, sino como un paso concreto.
+  // Si el contacto registrado es de un prospecto, el resultado elegido también
+  // mueve su etapa en el embudo de ventas — para que no quede solo como texto
+  // en el historial, sino como un paso concreto. Si es un cliente real de Siigo
+  // sin compras (o ya perdido), también usa el embudo y debe moverse igual.
   const _prospectoDeEstaLlamada = (APP.prospectos || []).find(x => x.id === clienteId);
+  const _clienteDeEstaLlamada = !_prospectoDeEstaLlamada ? (APP.data.clientes || []).find(x => x.id === clienteId) : null;
   if (_prospectoDeEstaLlamada) {
     const nuevaEtapa = etapaSegunResultado(resultado);
     if (nuevaEtapa) actualizarEtapaProspecto(clienteId, nuevaEtapa, { silencioso: true });
+  } else if (_clienteDeEstaLlamada && clienteElegibleEmbudo(_clienteDeEstaLlamada)) {
+    const nuevaEtapa = etapaSegunResultado(resultado);
+    if (nuevaEtapa) actualizarEtapaCliente(clienteId, nuevaEtapa, { silencioso: true });
   }
 
   // Si este registro viene de "Marcar como hecho" sobre un recordatorio puntual de
@@ -8378,7 +8396,7 @@ function itemRecordatorio(r, vencido, completado) {
         <div class="rec-hora">${horaLimpia}</div>
       </div>
       <div class="rec-content" onclick="abrirCliente('${escapeHTML(r.clienteId)}')">
-        <div class="rec-cliente-nom">${escapeHTML(nombreEntidad)}${r.accion && accionRecordatorioInfo(r.accion) ? `<span class="accion-badge">${accionRecordatorioInfo(r.accion).emoji} ${escapeHTML(accionRecordatorioInfo(r.accion).label)}</span>` : ''}</div>
+        <div class="rec-cliente-nom">${escapeHTML(nombreEntidad)}${r.accion && accionRecordatorioInfo(r.accion) ? `<span class="accion-badge">${accionRecordatorioInfo(r.accion).emoji} ${escapeHTML(accionRecordatorioInfo(r.accion).label)}</span>` : ''}${badgeEmbudoEntidad(c, pr)}</div>
         <div class="rec-desc-full">${[
           r.descripcion ? escapeHTML(r.descripcion) : '',
           telefonoEntidad(c, pr) ? `📞 <a href="tel:${escapeHTML(telefonoEntidad(c, pr))}" onclick="event.stopPropagation()">${escapeHTML(telefonoEntidad(c, pr))}</a>` : '',
@@ -8894,7 +8912,7 @@ function cardClienteHoy(c) {
         <span class="tipo-pill tipo-${tip.color}">${tip.icon}</span>
         <span class="estado-pill estado-${est.color}"><span class="dot dot-${est.color}"></span></span>
       </div>
-      <div class="hoy-nombre">${escapeHTML(c.nombre)}</div>
+      <div class="hoy-nombre">${escapeHTML(c.nombre)}${clienteElegibleEmbudo(c) ? pillEtapaHTML(etapaDeCliente(c)) : ''}</div>
       <div class="hoy-meta">
         ${fmtFrecuencia(c.frecuenciaDias)} · ${fmtMesesSin(c.mesesSinComprar)}
       </div>
