@@ -5920,6 +5920,18 @@ window.addEventListener('DOMContentLoaded', async () => {
   }
 });
 
+// Cuando el usuario vuelve a esta pestaña después de tenerla en el fondo,
+// Chrome pudo haber throttleado la carga inicial y los clientes no llegaron.
+// Si la pestaña queda visible y no hay clientes, reintenta la carga sola.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && AUTH && AUTH.token) {
+    const sinClientes = !APP.data.clientes || APP.data.clientes.length === 0;
+    if (sinClientes) {
+      cargarClientesDesdeServidor().catch(() => {});
+    }
+  }
+});
+
 async function iniciarApp() {
   APP.vendedorActivo = AUTH.user.nombre;
   
