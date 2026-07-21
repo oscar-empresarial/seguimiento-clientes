@@ -4523,12 +4523,23 @@ function iniciarRefrescoAutomatico() {
 // de nuevo a la pestaña. Apenas la pestaña vuelve a estar visible, refrescamos de
 // inmediato en vez de esperar el próximo ciclo de 5 minutos.
 let _fcUltimoRefrescoTs = 0;
+// ÚNICO handler de visibilitychange para refrescar datos (antes había dos por
+// separado — uno solo actuaba si la lista de clientes estaba vacía, así que si
+// ya había datos en caché, la pestaña se quedaba con datos viejos hasta F5).
+// Este siempre fuerza un refresco real y vuelve a pintar la pantalla, y si el
+// refresco falla lo deja visible en vez de fallar en silencio.
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
   if (!AUTH.token) return;
   if (Date.now() - _fcUltimoRefrescoTs < 15000) return; // evita ráfagas si cambia de pestaña varias veces seguidas
   _fcUltimoRefrescoTs = Date.now();
-  try { refrescarClientesEnSegundoPlano(); } catch (e) {}
+  refrescarClientesEnSegundoPlano().then(() => {
+    // Fuerza repintar aunque la vista actual no sea la de lista de clientes,
+    // para que lo que se ve en pantalla nunca quede desincronizado de APP.data.
+    try { if (typeof render === 'function') render(true); } catch (e) {}
+  }).catch(() => {
+    actualizarEstadoConexion('cache');
+  });
   cargarDatosUsuario().then(ok => {
     if (ok && typeof renderRecordatoriosSidebar === 'function') renderRecordatoriosSidebar();
   }).catch(() => {});
@@ -5925,17 +5936,9 @@ window.addEventListener('DOMContentLoaded', async () => {
   }
 });
 
-// Cuando el usuario vuelve a esta pestaña después de tenerla en el fondo,
-// Chrome pudo haber throttleado la carga inicial y los clientes no llegaron.
-// Si la pestaña queda visible y no hay clientes, reintenta la carga sola.
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && AUTH && AUTH.token) {
-    const sinClientes = !APP.data.clientes || APP.data.clientes.length === 0;
-    if (sinClientes) {
-      cargarClientesDesdeServidor().catch(() => {});
-    }
-  }
-});
+// (El refresco al volver a la pestaña quedó unificado en un solo handler,
+// más arriba en este archivo, para que siempre repinte y nunca se quede con
+// datos viejos en silencio — ver el comentario junto a _fcUltimoRefrescoTs.)
 
 async function iniciarApp() {
   APP.vendedorActivo = AUTH.user.nombre;
