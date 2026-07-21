@@ -113,6 +113,15 @@ function doPost(e) {
     var body = JSON.parse(e.postData.contents);
     var action = body.action;
 
+    // Los eventos que llegan desde Pabbly (webhook de Whatsfy) usan "wf_secret"
+    // en vez de "action" -- se delegan al manejador aparte en WhatsfyAutomation.gs.
+    // (2026-07-21: antes ese archivo tenia su PROPIO doPost, que chocaba con este
+    // y siempre ganaba, dejando toda la app de clientes en "NO_AUTORIZADO".)
+    var paramsEntrada = e && e.parameter ? e.parameter : {};
+    if (paramsEntrada.wf_secret || body.wf_secret) {
+      return wfProcesarWebhookPabblyEntrada_(e);
+    }
+
     if (action === 'login') {
       return jsonResponse(login(body.username, body.password));
     }
