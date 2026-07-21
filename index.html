@@ -9547,6 +9547,23 @@ async function cargarComercialCliente(clienteId, tab) {
 
   const data = await apiCall('cliente_facturas', { identificacion: clienteId });
   COMERCIAL_CLIENTE_CACHE[clienteId] = data || { facturas: [], cotizaciones: [], cartera: [] };
+
+  // El detalle de productos ("todosProductos") ya no viene en la lista inicial de
+  // clientes (se movió a un cache aparte para que la lista cargue rápido, ver
+  // ProductosClienteCache en Código.gs). Se trae aparte la primera vez que se abre
+  // la ficha de compras de este cliente, y se guarda directo sobre el objeto del
+  // cliente para que el resto del código (que ya lee c.todosProductos) siga
+  // funcionando igual sin más cambios.
+  const c = APP.data.clientes.find(x => x.id === clienteId);
+  if (c && c.todosProductos == null) {
+    try {
+      const prod = await apiCall('productos_cliente_obtener', { identificacion: clienteId });
+      c.todosProductos = (prod && prod.todosProductos) || [];
+    } catch (e) {
+      c.todosProductos = c.todosProductos || [];
+    }
+  }
+
   return COMERCIAL_CLIENTE_CACHE[clienteId];
 }
 
