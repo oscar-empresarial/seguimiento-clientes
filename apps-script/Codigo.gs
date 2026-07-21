@@ -4585,13 +4585,25 @@ function procesarClientesSiigo() {
   for (var i = 0; i < payload.length; i += chunkSize) filas.push([payload.substring(i, i + chunkSize)]);
   if (filas.length > 0) hojaCache.getRange(1, 1, filas.length, 1).setValues(filas);
 
-  // Guardar el detalle de productos por cliente aparte (evita que la lista pese 30+MB)
-  var hojaProd = ss.getSheetByName('ProductosClienteCache');
-  if (!hojaProd) {
-    hojaProd = ss.insertSheet('ProductosClienteCache');
-    hojaProd.getRange(1, 1, 1, 4).setValues([['Identificacion', 'Chunk', 'JSON', 'Fecha']]);
+  // Guardar el detalle de productos por cliente aparte (evita que la lista pese 30+MB).
+  // Se reintenta porque el servicio de Sheets puede quedar temporalmente sobrecargado
+  // justo despues de las lecturas/escrituras grandes de arriba (error real visto:
+  // "Service Spreadsheets timed out") -- casi siempre se resuelve solo si se reintenta
+  // unos segundos despues.
+  for (var intentoProd = 0; intentoProd < 3; intentoProd++) {
+    try {
+      var hojaProd = ss.getSheetByName('ProductosClienteCache');
+      if (!hojaProd) {
+        hojaProd = ss.insertSheet('ProductosClienteCache');
+        hojaProd.getRange(1, 1, 1, 4).setValues([['Identificacion', 'Chunk', 'JSON', 'Fecha']]);
+      }
+      guardarJSONPorClienteEnChunks(ss, 'ProductosClienteCache', mapaProductosCliente, null);
+      break;
+    } catch (errProd) {
+      if (intentoProd >= 2) throw errProd;
+      Utilities.sleep(5000);
+    }
   }
-  guardarJSONPorClienteEnChunks(ss, 'ProductosClienteCache', mapaProductosCliente, null);
 
   var props = PropertiesService.getScriptProperties();
   props.setProperty('clientes_cache_fecha', hoy.toISOString());
