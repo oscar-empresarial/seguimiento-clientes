@@ -4525,7 +4525,15 @@ function procesarClientesSiigo() {
     var tipo = esEmpresa ? 'empresa' : 'hogar';
     var tel = String(c[7] || '').trim();
 
-    mapaProductosCliente[ident] = todosProductos;
+    // Todo el detalle historico pesado (productos y compras mes a mes) se guarda
+    // aparte, por cliente, y se trae solo cuando alguien abre SU ficha -- no hace
+    // falta para la lista/dashboard, y es lo que hacia pesar el cache original.
+    mapaProductosCliente[ident] = {
+      todosProductos: todosProductos,
+      topProductos: topProductos,
+      comprasPorMes: comprasPorMes,
+      topGrupos: total > 0 ? [{ grupo: 'Productos', valor: Math.round(total) }] : [],
+    };
 
     clientes.push({
       id: ident,
@@ -4550,9 +4558,6 @@ function procesarClientesSiigo() {
       mesesSinComprar: mesesSinComprar,
       numCompras: numCompras,
       estado: estado,
-      topProductos: topProductos,
-      topGrupos: total > 0 ? [{ grupo: 'Productos', valor: Math.round(total) }] : [],
-      comprasPorMes: comprasPorMes,
       cambioPatron: cambioPatron,
     });
   }
@@ -5160,9 +5165,16 @@ function listarVendedoresActivos() {
 }
 
 function obtenerProductosCliente(identificacion) {
-  if (!identificacion) return { todosProductos: [] };
+  var vacio = { todosProductos: [], topProductos: [], comprasPorMes: [], topGrupos: [] };
+  if (!identificacion) return vacio;
   var idLimpia = normalizarIdentificacion(identificacion);
   var ss = getOrCreateSheet();
-  var todosProductos = leerJSONPorClienteDesdeCache(ss, 'ProductosClienteCache', idLimpia);
-  return { todosProductos: todosProductos || [] };
+  var datos = leerJSONPorClienteDesdeCache(ss, 'ProductosClienteCache', idLimpia);
+  if (!datos) return vacio;
+  return {
+    todosProductos: datos.todosProductos || [],
+    topProductos: datos.topProductos || [],
+    comprasPorMes: datos.comprasPorMes || [],
+    topGrupos: datos.topGrupos || [],
+  };
 }
